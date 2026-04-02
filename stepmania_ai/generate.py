@@ -17,6 +17,7 @@ from pathlib import Path
 import librosa
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from stepmania_ai.data.audio_features import (
     FRAME_RATE,
@@ -50,12 +51,15 @@ def detect_onsets(
     all_probs = np.zeros(n_frames)
 
     with torch.no_grad():
-        for start in range(0, n_frames, chunk_size):
+        starts = range(0, n_frames, chunk_size)
+        starts = tqdm(starts, desc="Scoring onset chunks", total=(n_frames + chunk_size - 1) // chunk_size, leave=False)
+        for start in starts:
             end = min(start + chunk_size, n_frames)
-            windows = []
-            for i in range(start, end):
-                windows.append(features.get_context_window(i, context_window))
-            batch = torch.tensor(np.stack(windows), dtype=torch.float32).to(device)
+            windows = features.get_context_windows(
+                np.arange(start, end),
+                window_size=context_window,
+            )
+            batch = torch.tensor(windows, dtype=torch.float32).to(device)
             logits = model.forward_framewise(batch).squeeze(-1)
             probs = torch.sigmoid(logits).cpu().numpy()
             all_probs[start:end] = probs
@@ -87,11 +91,9 @@ def generate_patterns(
         return np.zeros((0, 4))
 
     # Build audio windows for onset frames
-    windows = []
-    for f in onset_frames:
-        windows.append(features.get_context_window(f, context_window))
+    windows = features.get_context_windows(onset_frames, window_size=context_window)
     audio_windows = torch.tensor(
-        np.stack(windows), dtype=torch.float32
+        windows, dtype=torch.float32
     ).unsqueeze(0).to(device)  # (1, n_onsets, n_feat, ctx)
 
     # Time deltas
@@ -100,7 +102,12 @@ def generate_patterns(
     time_deltas = torch.tensor(deltas, dtype=torch.float32).unsqueeze(0).to(device)
 
     # Generate autoregressively
-    patterns = model.generate(audio_windows, time_deltas, temperature=temperature)
+    patterns = model.generate(
+        audio_windows,
+        time_deltas,
+        temperature=temperature,
+        show_progress=True,
+    )
     return patterns.cpu().numpy()
 
 

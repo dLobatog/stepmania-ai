@@ -13,6 +13,7 @@ import math
 
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 
 class PositionalEncoding(nn.Module):
@@ -156,6 +157,7 @@ class PatternGenerator(nn.Module):
         audio_windows: torch.Tensor,
         time_deltas: torch.Tensor,
         temperature: float = 1.0,
+        show_progress: bool = False,
     ) -> torch.Tensor:
         """Autoregressive generation — no teacher forcing.
 
@@ -170,7 +172,11 @@ class PatternGenerator(nn.Module):
         prev_arrows = torch.zeros(1, seq_len, 4, device=audio_windows.device)
         generated = torch.zeros(seq_len, 4, device=audio_windows.device)
 
-        for t in range(seq_len):
+        steps = range(seq_len)
+        if show_progress:
+            steps = tqdm(steps, total=seq_len, desc="Generating patterns", leave=False)
+
+        for t in steps:
             # Only process up to current timestep
             logits = self.forward(
                 audio_windows[:, :t + 1],
