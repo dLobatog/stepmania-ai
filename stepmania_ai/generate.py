@@ -53,6 +53,15 @@ def _stairs_like(last_four_columns: list[int]) -> bool:
     return last_four_columns in ([0, 1, 2, 3], [3, 2, 1, 0])
 
 
+def _recent_single_columns(history: list[np.ndarray], limit: int = 6) -> list[int]:
+    cols: list[int] = []
+    for pattern in history[-limit:]:
+        col = _pattern_single_column(pattern)
+        if col is not None:
+            cols.append(col)
+    return cols
+
+
 def _transition_penalty(
     candidate: np.ndarray,
     history: list[np.ndarray],
@@ -65,6 +74,7 @@ def _transition_penalty(
     penalty = 0.0
     candidate_is_jump = _pattern_is_jump(candidate)
     candidate_col = _pattern_single_column(candidate)
+    recent_single_cols = _recent_single_columns(history, limit=6)
 
     if candidate_is_jump:
         penalty -= 0.15
@@ -89,9 +99,11 @@ def _transition_penalty(
             and candidate_col == prev_col
         ):
             if delta_t < 0.20:
-                penalty -= 1.75
+                penalty -= 3.0
             elif delta_t < 0.35:
-                penalty -= 0.85
+                penalty -= 1.8
+            elif delta_t < 0.50:
+                penalty -= 0.75
             else:
                 penalty -= 0.25
 
@@ -104,6 +116,37 @@ def _transition_penalty(
             four_cols = [int(col) for col in last_three_cols] + [candidate_col]
             if _stairs_like(four_cols):
                 penalty -= 1.0
+
+    # Fast same-arrow triples are close to unplayable, so punish them hard.
+    if (
+        candidate_col is not None
+        and len(recent_single_cols) >= 2
+        and recent_single_cols[-1] == candidate_col
+        and recent_single_cols[-2] == candidate_col
+    ):
+        if delta_t < 0.42:
+            penalty -= 5.0
+        else:
+            penalty -= 2.0
+
+    # Low-variety streams feel robotic even when they're legal.
+    if candidate_col is not None and delta_t < 0.32:
+        stream_cols = recent_single_cols[-4:] + [candidate_col]
+        if len(stream_cols) >= 4:
+            unique_cols = len(set(stream_cols))
+            if unique_cols <= 2:
+                penalty -= 1.5
+            if stream_cols.count(candidate_col) >= 3:
+                penalty -= 1.25
+
+    # Gently reward moving to a different column in a dense single-note stream.
+    if (
+        candidate_col is not None
+        and len(recent_single_cols) >= 1
+        and delta_t < 0.28
+        and recent_single_cols[-1] != candidate_col
+    ):
+        penalty += 0.2
 
     recent_jumps = sum(1 for pattern in history[-4:] if _pattern_is_jump(pattern))
     if candidate_is_jump and recent_jumps >= 2:
