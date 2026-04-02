@@ -8,7 +8,9 @@ For each audio frame (~10ms), we produce:
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import pickle
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -124,6 +126,7 @@ class StepChartDataset(Dataset):
         context_frames: int = 7,
         cache_dir: str | Path | None = None,
         quality_label: float = 1.0,
+        n_workers: int | None = None,
     ):
         self.context_frames = context_frames
         self.quality_label = quality_label
@@ -143,8 +146,26 @@ class StepChartDataset(Dataset):
 
         print(f"Found {len(sm_files)} .sm files")
 
-        for sm_path in tqdm(sm_files, desc="Loading songs"):
-            data = build_song_data(sm_path, difficulty=difficulty, cache_dir=cache_dir)
+        # Parallel feature extraction
+        if n_workers is None:
+            n_workers = min(mp.cpu_count(), 8)
+
+        worker_fn = partial(build_song_data, difficulty=difficulty, cache_dir=cache_dir)
+
+        if n_workers > 1:
+            print(f"Extracting features with {n_workers} workers...")
+            with mp.Pool(n_workers) as pool:
+                results = list(tqdm(
+                    pool.imap(worker_fn, sm_files),
+                    total=len(sm_files),
+                    desc="Loading songs",
+                ))
+        else:
+            results = []
+            for sm_path in tqdm(sm_files, desc="Loading songs"):
+                results.append(worker_fn(sm_path))
+
+        for data in results:
             if data is None:
                 continue
             song_idx = len(self.songs)

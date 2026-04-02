@@ -28,7 +28,6 @@ class AudioFeatures:
 
     mel_spectrogram: np.ndarray  # (n_mels, n_frames)
     onset_envelope: np.ndarray  # (n_frames,)
-    tempogram: np.ndarray  # (n_tempo_bins, n_frames)
     chroma: np.ndarray  # (12, n_frames)
     beat_frames: np.ndarray  # frame indices of detected beats
     duration: float  # seconds
@@ -104,11 +103,6 @@ def extract_features(audio_path: str | Path) -> AudioFeatures:
     # Normalize
     onset_env = onset_env / (onset_env.max() + 1e-8)
 
-    # Tempogram (tempo over time)
-    tempogram = librosa.feature.tempogram(
-        onset_envelope=onset_env, sr=sr, hop_length=HOP_LENGTH
-    )
-
     # Chroma features
     chroma = librosa.feature.chroma_cqt(
         y=y, sr=sr, hop_length=HOP_LENGTH
@@ -120,16 +114,14 @@ def extract_features(audio_path: str | Path) -> AudioFeatures:
     )
 
     # Ensure all features have same number of frames
-    n_frames = min(mel_db.shape[1], len(onset_env), tempogram.shape[1], chroma.shape[1])
+    n_frames = min(mel_db.shape[1], len(onset_env), chroma.shape[1])
     mel_db = mel_db[:, :n_frames]
     onset_env = onset_env[:n_frames]
-    tempogram = tempogram[:, :n_frames]
     chroma = chroma[:, :n_frames]
 
     return AudioFeatures(
         mel_spectrogram=mel_db.astype(np.float32),
         onset_envelope=onset_env.astype(np.float32),
-        tempogram=tempogram.astype(np.float32),
         chroma=chroma.astype(np.float32),
         beat_frames=beat_frames,
         duration=duration,
@@ -149,7 +141,6 @@ def main():
     print(f"Frames: {features.n_frames} ({FRAME_RATE:.1f} fps)")
     print(f"Mel shape: {features.mel_spectrogram.shape}")
     print(f"Onset envelope shape: {features.onset_envelope.shape}")
-    print(f"Tempogram shape: {features.tempogram.shape}")
     print(f"Chroma shape: {features.chroma.shape}")
     print(f"Detected beats: {len(features.beat_frames)}")
 
