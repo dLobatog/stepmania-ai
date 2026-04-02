@@ -158,6 +158,7 @@ class PatternGenerator(nn.Module):
         time_deltas: torch.Tensor,
         temperature: float = 1.0,
         show_progress: bool = False,
+        max_history_steps: int = 64,
     ) -> torch.Tensor:
         """Autoregressive generation — no teacher forcing.
 
@@ -177,14 +178,14 @@ class PatternGenerator(nn.Module):
             steps = tqdm(steps, total=seq_len, desc="Generating patterns", leave=False)
 
         for t in steps:
-            # Only process up to current timestep
+            start = max(0, t + 1 - max_history_steps)
             logits = self.forward(
-                audio_windows[:, :t + 1],
-                prev_arrows[:, :t + 1],
-                time_deltas[:, :t + 1],
+                audio_windows[:, start:t + 1],
+                prev_arrows[:, start:t + 1],
+                time_deltas[:, start:t + 1],
             )
             # Get prediction for current step
-            step_logits = logits[0, t] / temperature  # (4,)
+            step_logits = logits[0, -1] / temperature  # (4,)
             probs = torch.sigmoid(step_logits)
             arrows = (torch.rand(4, device=probs.device) < probs).float()
 

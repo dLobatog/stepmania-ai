@@ -29,26 +29,11 @@ from stepmania_ai.data.audio_features import (
 )
 from stepmania_ai.models.onset_detector import OnsetDetector
 from stepmania_ai.models.pattern_generator import PatternGenerator
+from stepmania_ai.models.pattern_token_generator import PatternTokenGenerator
+from stepmania_ai.models.pattern_vocab import ERGONOMIC_PATTERN_VOCAB, VOCAB_SIZE, token_to_pattern
 
 
 ARROW_CHARS = "0123"  # left, down, up, right
-
-# Small, explicitly playable vocabulary used by the ergonomics-aware decoder.
-SINGLE_PATTERNS = (
-    (1, 0, 0, 0),
-    (0, 1, 0, 0),
-    (0, 0, 1, 0),
-    (0, 0, 0, 1),
-)
-JUMP_PATTERNS = (
-    (1, 1, 0, 0),
-    (1, 0, 1, 0),
-    (1, 0, 0, 1),
-    (0, 1, 1, 0),
-    (0, 1, 0, 1),
-    (0, 0, 1, 1),
-)
-ERGONOMIC_PATTERN_VOCAB = SINGLE_PATTERNS + JUMP_PATTERNS
 
 
 def _pattern_is_jump(pattern: np.ndarray) -> bool:
@@ -139,6 +124,31 @@ def _candidate_scores(
     ).sum(dim=1)
 
 
+def load_pattern_model(
+    pattern_model_path: str | Path,
+    device: torch.device,
+) -> tuple[PatternGenerator | PatternTokenGenerator, str]:
+    payload = torch.load(pattern_model_path, map_location=device)
+
+    if isinstance(payload, dict) and "model_type" in payload and "state_dict" in payload:
+        model_type = payload["model_type"]
+        if model_type == "pattern_token_generator":
+            model = PatternTokenGenerator(vocab_size=int(payload.get("vocab_size", VOCAB_SIZE)))
+            model.load_state_dict(payload["state_dict"])
+            model.to(device)
+            return model, "token"
+        if model_type == "pattern_generator":
+            model = PatternGenerator()
+            model.load_state_dict(payload["state_dict"])
+            model.to(device)
+            return model, "binary"
+
+    model = PatternGenerator()
+    model.load_state_dict(payload)
+    model.to(device)
+    return model, "binary"
+
+
 def detect_onsets(
     features: AudioFeatures,
     model: OnsetDetector,
@@ -184,11 +194,13 @@ def detect_onsets(
 def generate_patterns(
     features: AudioFeatures,
     onset_frames: np.ndarray,
-    model: PatternGenerator,
+    model: PatternGenerator | PatternTokenGenerator,
     device: torch.device,
     temperature: float = 0.8,
     decode_strategy: str = "ergonomic",
+    pattern_mode: str = "binary",
     context_window: int = 7,
+    max_history_steps: int = 64,
 ) -> np.ndarray:
     """Generate arrow patterns for detected onsets."""
     model.eval()
@@ -208,12 +220,13 @@ def generate_patterns(
     deltas = np.diff(times, prepend=times[0])
     time_deltas = torch.tensor(deltas, dtype=torch.float32).unsqueeze(0).to(device)
 
-    if decode_strategy == "raw":
+    if pattern_mode == "binary" and decode_strategy == "raw":
         patterns = model.generate(
             audio_windows,
             time_deltas,
             temperature=temperature,
             show_progress=True,
+            max_history_steps=max_history_steps,
         )
         return patterns.cpu().numpy()
 
@@ -221,25 +234,47 @@ def generate_patterns(
     candidate_patterns = torch.tensor(candidate_patterns_np, dtype=torch.float32, device=device)
 
     generated = torch.zeros(n_onsets, 4, device=device)
-    prev_arrows = torch.zeros(1, n_onsets, 4, device=device)
     history: list[np.ndarray] = []
+
+    if pattern_mode == "binary":
+        prev_arrows = torch.zeros(1, n_onsets, 4, device=device)
+    else:
+        prev_tokens = torch.full(
+            (1, n_onsets),
+            VOCAB_SIZE,
+            dtype=torch.long,
+            device=device,
+        )
 
     steps = tqdm(range(n_onsets), total=n_onsets, desc="Generating patterns", leave=False)
     for t in steps:
-        logits = model(
-            audio_windows[:, :t + 1],
-            prev_arrows[:, :t + 1],
-            time_deltas[:, :t + 1],
-        )
-        step_logits = logits[0, t] / temperature
-        raw_scores = _candidate_scores(step_logits, candidate_patterns).cpu().numpy()
-        penalties = np.array(
-            [
-                _transition_penalty(candidate, history, float(deltas[t]))
-                for candidate in candidate_patterns_np
-            ],
-            dtype=np.float32,
-        )
+        start = max(0, t + 1 - max_history_steps)
+        if pattern_mode == "binary":
+            logits = model(
+                audio_windows[:, start:t + 1],
+                prev_arrows[:, start:t + 1],
+                time_deltas[:, start:t + 1],
+            )
+            step_logits = logits[0, -1] / temperature
+            raw_scores = _candidate_scores(step_logits, candidate_patterns).detach().cpu().numpy()
+        else:
+            logits = model(
+                audio_windows[:, start:t + 1],
+                prev_tokens[:, start:t + 1],
+                time_deltas[:, start:t + 1],
+            )
+            step_logits = logits[0, -1] / temperature
+            raw_scores = F.log_softmax(step_logits, dim=-1).detach().cpu().numpy()
+        if decode_strategy == "ergonomic":
+            penalties = np.array(
+                [
+                    _transition_penalty(candidate, history, float(deltas[t]))
+                    for candidate in candidate_patterns_np
+                ],
+                dtype=np.float32,
+            )
+        else:
+            penalties = np.zeros(len(candidate_patterns_np), dtype=np.float32)
         best_idx = int(np.argmax(raw_scores + penalties))
         best_pattern = candidate_patterns[best_idx]
 
@@ -247,7 +282,10 @@ def generate_patterns(
         history.append(candidate_patterns_np[best_idx])
 
         if t + 1 < n_onsets:
-            prev_arrows[0, t + 1] = best_pattern
+            if pattern_mode == "binary":
+                prev_arrows[0, t + 1] = best_pattern
+            else:
+                prev_tokens[0, t + 1] = best_idx
 
     return generated.cpu().numpy()
 
@@ -269,7 +307,7 @@ def quantize_to_beats(
 
     positions = []
     for t in onset_times:
-        adjusted = t + offset
+        adjusted = t - offset
         if adjusted < 0:
             continue
         subdivision = round(adjusted / secs_per_subdivision)
@@ -398,9 +436,8 @@ def generate_chart(
     onset_model.load_state_dict(torch.load(onset_model_path, weights_only=True, map_location=device))
     onset_model.to(device)
 
-    pattern_model = PatternGenerator()
-    pattern_model.load_state_dict(torch.load(pattern_model_path, weights_only=True, map_location=device))
-    pattern_model.to(device)
+    pattern_model, pattern_mode = load_pattern_model(pattern_model_path, device)
+    print(f"  Pattern mode: {pattern_mode}")
 
     # Detect BPM
     tempo = librosa.beat.tempo(
@@ -426,6 +463,7 @@ def generate_chart(
         device,
         temperature=temperature,
         decode_strategy=decode_strategy,
+        pattern_mode=pattern_mode,
     )
 
     # Write .sm file
