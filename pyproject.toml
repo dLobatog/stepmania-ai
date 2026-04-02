@@ -1,0 +1,28 @@
+[project]
+name = "stepmania-ai"
+version = "0.1.0"
+description = "ML-powered StepMania chart generator"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.2",
+    "torchaudio>=2.2",
+    "librosa>=0.10",
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "soundfile>=0.12",
+    "tqdm>=4.66",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ipython"]
+
+[project.scripts]
+smai-parse = "stepmania_ai.utils.sm_parser:main"
+smai-extract = "stepmania_ai.data.audio_features:main"
+smai-train = "stepmania_ai.train:main"
+smai-generate = "stepmania_ai.generate:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
