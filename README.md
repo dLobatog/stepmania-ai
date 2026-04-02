@@ -25,14 +25,15 @@ These three features are stacked into a 93-channel feature vector (80 + 1 + 12) 
 
 - **Balanced sampling**: only ~5% of frames have notes, so onset frames are oversampled to 50/50 balance
 - **Two-phase**: onset detector trains first on all frames, then pattern generator trains only on onset frames
-- **Parallel data loading**: audio feature extraction runs across all CPU cores (8 workers by default)
-- **TensorBoard**: training logs loss, precision/recall/F1, per-arrow accuracy, and learning rate to `runs/`
+- **Song-level validation split**: training can hold out a reproducible slice of songs for validation and early stopping
+- **Parallel data loading**: audio feature extraction runs across CPU workers (4 by default)
+- **TensorBoard**: training logs train/validation loss, precision/recall/F1, per-arrow accuracy, and learning rate to `runs/`
 
 ## Memory & Performance
 
 ### Data loading
 
-Audio feature extraction happens once per song and is cached to `.cache/features/`. Each cached song is ~8 MB in memory (mel + onset + chroma + labels). Extraction uses multiprocessing (8 workers by default) and takes ~3-5 seconds per uncached song.
+Audio feature extraction happens once per song and is cached to `.cache/features/`. Each cached song is ~8 MB in memory (mel + onset + chroma + labels). Extraction uses multiprocessing (4 workers by default) and takes ~3-5 seconds per uncached song.
 
 | Songs | In-memory | Cache on disk | First load | Subsequent loads |
 |-------|-----------|---------------|------------|-----------------|
@@ -67,6 +68,23 @@ smai-train path/to/pack1 path/to/pack2 \
     --batch-size 256
 ```
 
+Fast verification run:
+
+```bash
+smai-train ~/Downloads/StepmaniaPipelineSmaller \
+    --dev
+```
+
+Or pick a reproducible subset from a larger pack:
+
+```bash
+smai-train ~/Downloads/StepmaniaPipeline \
+    --max-songs 96 \
+    --train-samples-per-epoch 100000 \
+    --validation-split 0.1 \
+    --patience 2
+```
+
 ### Monitor training
 
 ```bash
@@ -74,7 +92,7 @@ tensorboard --logdir runs
 # Open http://localhost:6006
 ```
 
-Tracks: onset loss/precision/recall/F1, pattern loss/accuracy (overall + per-arrow), learning rates.
+Tracks: onset and pattern train/validation loss, onset precision/recall/F1, pattern accuracy (overall + per-arrow), and learning rates.
 
 ### Generate a chart from audio
 
