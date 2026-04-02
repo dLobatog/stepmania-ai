@@ -26,30 +26,78 @@ from stepmania_ai.data.audio_features import (
 from stepmania_ai.utils.sm_parser import Chart, NoteRow, Simfile, parse_sm
 
 
-def _snap_notes_to_frames(chart: Chart, n_frames: int) -> tuple[np.ndarray, np.ndarray]:
+CACHE_VERSION = "v3-holds"
+
+
+def _snap_notes_to_frames(
+    chart: Chart,
+    n_frames: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Align chart notes to audio frames.
 
     Returns:
         onset_labels: (n_frames,) binary array — 1 where a note exists
         arrow_labels: (n_frames, 4) binary array — which arrows are active per frame
+        hold_start_labels: (n_frames,) binary array — 1 where a simple hold starts
+        hold_duration_beats: (n_frames,) float array — duration in beats for simple hold starts
+        roll_start_labels: (n_frames,) binary array — 1 where a simple roll starts
     """
     onset_labels = np.zeros(n_frames, dtype=np.float32)
     arrow_labels = np.zeros((n_frames, 4), dtype=np.float32)
+    hold_start_labels = np.zeros(n_frames, dtype=np.float32)
+    hold_duration_beats = np.zeros(n_frames, dtype=np.float32)
+    roll_start_labels = np.zeros(n_frames, dtype=np.float32)
+    active_heads: dict[int, tuple[int, float, bool, bool]] = {}
 
     for row in chart.note_rows:
-        if not row.has_tap:
-            continue
         frame = int(round(row.time * FRAME_RATE))
+        if not row.has_tap:
+            if row.tail_columns:
+                for col in row.tail_columns:
+                    start = active_heads.pop(col, None)
+                    if start is None:
+                        continue
+                    start_frame, start_beat, is_roll, is_trackable = start
+                    if is_trackable and not is_roll and 0 <= start_frame < n_frames:
+                        hold_duration_beats[start_frame] = max(0.0, row.beat - start_beat)
+            continue
+
         if 0 <= frame < n_frames:
             onset_labels[frame] = 1.0
             for col in row.tap_columns:
                 arrow_labels[frame, col] = 1.0
 
-    return onset_labels, arrow_labels
+        is_simple_single = len(row.tap_columns) == 1
+
+        for col in row.hold_head_columns:
+            is_trackable = is_simple_single and len(row.hold_head_columns) == 1 and len(row.roll_head_columns) == 0
+            active_heads[col] = (frame, row.beat, False, is_trackable)
+            if is_trackable and 0 <= frame < n_frames:
+                hold_start_labels[frame] = 1.0
+
+        for col in row.roll_head_columns:
+            is_trackable = is_simple_single and len(row.roll_head_columns) == 1 and len(row.hold_head_columns) == 0
+            active_heads[col] = (frame, row.beat, True, is_trackable)
+            if is_trackable and 0 <= frame < n_frames:
+                roll_start_labels[frame] = 1.0
+
+        for col in row.tail_columns:
+            start = active_heads.pop(col, None)
+            if start is None:
+                continue
+            start_frame, start_beat, is_roll, is_trackable = start
+            if is_trackable and 0 <= start_frame < n_frames:
+                if is_roll:
+                    roll_start_labels[start_frame] = 1.0
+                else:
+                    hold_duration_beats[start_frame] = max(0.0, row.beat - start_beat)
+
+    return onset_labels, arrow_labels, hold_start_labels, hold_duration_beats, roll_start_labels
 
 
 def _cache_key(sm_path: Path) -> str:
-    return hashlib.md5(str(sm_path.resolve()).encode()).hexdigest()[:12]
+    payload = f"{CACHE_VERSION}:{sm_path.resolve()}"
+    return hashlib.md5(payload.encode()).hexdigest()[:12]
 
 
 def discover_sm_files(pack_dirs: list[str | Path]) -> list[Path]:
@@ -108,12 +156,18 @@ def build_song_data(
             return None
 
     features = extract_features(audio_path, skip_beats=True)
-    onset_labels, arrow_labels = _snap_notes_to_frames(chart, features.n_frames)
+    onset_labels, arrow_labels, hold_start_labels, hold_duration_beats, roll_start_labels = _snap_notes_to_frames(
+        chart,
+        features.n_frames,
+    )
 
     data = {
         "features": features,
         "onset_labels": onset_labels,
         "arrow_labels": arrow_labels,
+        "hold_start_labels": hold_start_labels,
+        "hold_duration_beats": hold_duration_beats,
+        "roll_start_labels": roll_start_labels,
         "title": sm.title,
         "difficulty": chart.difficulty,
         "rating": chart.rating,

@@ -63,6 +63,7 @@ Notes:
 
 - The onset model class defines a CNN + BiGRU, but the current training/inference path uses `forward_framewise()`, so the effective context today is dominated by the local 7-frame window rather than long-sequence recurrence.
 - The token pattern path is intentionally constrained to common singles and jumps. The goal is not to force jumps into every song; it is to make pattern generation easier to analyze, ablate, and improve.
+- Holds are now preserved distinctly in the parser/dataset and the codebase includes a first-pass hold predictor. Rolls are recognized in the parser/cache but are not yet generated back out.
 - Generation now uses a rolling recent-history window during autoregressive decode, which keeps 1-minute previews practical without asking the model to reason over more history than it saw in training.
 
 ### Audio Features
@@ -138,6 +139,7 @@ Pattern-only POC run that reuses an existing onset checkpoint:
 ```bash
 smai-train ~/Downloads/StepmaniaPipelineSmaller \
     --pattern-mode token \
+    --epochs-hold 4 \
     --skip-onset-training \
     --onset-checkpoint checkpoints/smaller-dev-20260402-164827/onset_detector.pt
 ```
@@ -167,6 +169,7 @@ Tracks: onset and pattern train/validation loss, onset precision/recall/F1, patt
 smai-generate song.ogg \
     --onset-model checkpoints/onset_detector.pt \
     --pattern-model checkpoints/pattern_generator.pt \
+    --hold-model checkpoints/hold_note_predictor.pt \
     --difficulty Challenge \
     --rating 10 \
     --threshold 0.5 \

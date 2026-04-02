@@ -60,6 +60,18 @@ class NoteRow:
     def tap_columns(self) -> list[int]:
         return [i for i, c in enumerate(self.arrows) if c in (NOTE_TAP, NOTE_HOLD_HEAD, NOTE_ROLL_HEAD)]
 
+    @property
+    def hold_head_columns(self) -> list[int]:
+        return [i for i, c in enumerate(self.arrows) if c == NOTE_HOLD_HEAD]
+
+    @property
+    def roll_head_columns(self) -> list[int]:
+        return [i for i, c in enumerate(self.arrows) if c == NOTE_ROLL_HEAD]
+
+    @property
+    def tail_columns(self) -> list[int]:
+        return [i for i, c in enumerate(self.arrows) if c == NOTE_HOLD_TAIL]
+
 
 @dataclass
 class Chart:

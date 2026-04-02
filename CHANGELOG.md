@@ -70,6 +70,9 @@ Short term:
 - expand evaluation beyond loss/accuracy into pattern statistics and clip-based qualitative review
 - compare `raw` vs `ergonomic` decoding on fixed clips and save the comparison as structured artifacts
 - tune the constrained decoder using known StepMania / ITG pattern categories
+- finish the current full-pack pattern run, then regenerate fresh 1-minute `migos` and `paseo_estopa` clips as the fixed qualitative check
+- after those clip checks, implement a window-level pattern objective so training scores short motif quality instead of only per-onset token accuracy
+- keep the per-token loss, but add short-horizon transition or n-gram supervision so repetitive streams and accidental jacks are penalized during training rather than only at decode time
 
 Medium term:
 

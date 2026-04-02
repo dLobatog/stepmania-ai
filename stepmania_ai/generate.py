@@ -27,10 +27,12 @@ from stepmania_ai.data.audio_features import (
     AudioFeatures,
     extract_features,
 )
+from stepmania_ai.models.hold_note_predictor import HoldNotePredictor
+from stepmania_ai.models.hold_utils import bucket_to_duration_beats
 from stepmania_ai.models.onset_detector import OnsetDetector
 from stepmania_ai.models.pattern_generator import PatternGenerator
 from stepmania_ai.models.pattern_token_generator import PatternTokenGenerator
-from stepmania_ai.models.pattern_vocab import ERGONOMIC_PATTERN_VOCAB, VOCAB_SIZE, token_to_pattern
+from stepmania_ai.models.pattern_vocab import ERGONOMIC_PATTERN_VOCAB, VOCAB_SIZE
 
 
 ARROW_CHARS = "0123"  # left, down, up, right
@@ -192,6 +194,24 @@ def load_pattern_model(
     return model, "binary"
 
 
+def load_hold_model(
+    hold_model_path: str | Path | None,
+    device: torch.device,
+) -> HoldNotePredictor | None:
+    if hold_model_path is None:
+        return None
+
+    payload = torch.load(hold_model_path, map_location=device)
+    if not isinstance(payload, dict) or payload.get("model_type") != "hold_note_predictor":
+        raise ValueError(f"Unsupported hold model checkpoint: {hold_model_path}")
+
+    model = HoldNotePredictor()
+    model.load_state_dict(payload["state_dict"])
+    model.to(device)
+    model.eval()
+    return model
+
+
 def detect_onsets(
     features: AudioFeatures,
     model: OnsetDetector,
@@ -333,6 +353,46 @@ def generate_patterns(
     return generated.cpu().numpy()
 
 
+def predict_holds(
+    features: AudioFeatures,
+    onset_frames: np.ndarray,
+    arrow_patterns: np.ndarray,
+    model: HoldNotePredictor | None,
+    device: torch.device,
+    context_window: int = 7,
+    hold_threshold: float = 0.55,
+) -> list[tuple[int, float] | None]:
+    if model is None or len(onset_frames) == 0:
+        return [None] * len(onset_frames)
+
+    windows = features.get_context_windows(onset_frames, window_size=context_window)
+    audio_windows = torch.tensor(windows, dtype=torch.float32).unsqueeze(0).to(device)
+    current_arrows = torch.tensor(arrow_patterns, dtype=torch.float32).unsqueeze(0).to(device)
+    prev_arrows = torch.zeros_like(current_arrows)
+    prev_arrows[:, 1:] = current_arrows[:, :-1]
+
+    times = np.array([features.frame_to_time(f) for f in onset_frames], dtype=np.float32)
+    deltas = np.diff(times, prepend=times[0])
+    time_deltas = torch.tensor(deltas, dtype=torch.float32).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        hold_logits, duration_logits = model(audio_windows, current_arrows, prev_arrows, time_deltas)
+        hold_probs = torch.sigmoid(hold_logits[0]).cpu().numpy()
+        duration_buckets = torch.argmax(duration_logits[0], dim=-1).cpu().numpy()
+
+    hold_events: list[tuple[int, float] | None] = []
+    for arrows, hold_prob, bucket in zip(arrow_patterns, hold_probs, duration_buckets):
+        active = np.flatnonzero(arrows > 0.5)
+        if len(active) != 1 or hold_prob < hold_threshold:
+            hold_events.append(None)
+            continue
+        col = int(active[0])
+        duration_beats = bucket_to_duration_beats(int(bucket))
+        hold_events.append((col, duration_beats))
+
+    return hold_events
+
+
 def quantize_to_beats(
     onset_times: np.ndarray,
     bpm: float,
@@ -370,6 +430,7 @@ def write_sm_file(
     offset: float,
     onset_times: np.ndarray,
     arrow_patterns: np.ndarray,
+    hold_events: list[tuple[int, float] | None] | None = None,
     difficulty: str = "Challenge",
     rating: int = 10,
     snap: int = 16,
@@ -382,8 +443,33 @@ def write_sm_file(
         print("Warning: no valid note positions after quantization")
         return
 
-    # Build measure data
-    max_measure = max(m for m, _ in positions) + 1
+    if hold_events is None:
+        hold_events = [None] * len(positions)
+
+    note_rows_abs = [measure * snap + row for measure, row in positions]
+    max_abs_row = max(note_rows_abs) if note_rows_abs else 0
+    hold_tail_rows: list[int | None] = [None] * len(positions)
+
+    for i, event in enumerate(hold_events):
+        if event is None:
+            continue
+        hold_col, duration_beats = event
+        tail_offset_rows = max(1, int(round(duration_beats * snap / 4.0)))
+        start_abs = note_rows_abs[i]
+        planned_tail = start_abs + tail_offset_rows
+
+        for j in range(i + 1, len(positions)):
+            next_pattern = arrow_patterns[j]
+            if next_pattern[hold_col] > 0.5:
+                planned_tail = min(planned_tail, note_rows_abs[j] - 1)
+                break
+
+        if planned_tail <= start_abs:
+            continue
+        hold_tail_rows[i] = planned_tail
+        max_abs_row = max(max_abs_row, planned_tail)
+
+    max_measure = max_abs_row // snap + 1
 
     # Create measure arrays (snap rows per measure)
     measures: list[list[str]] = []
@@ -391,11 +477,24 @@ def write_sm_file(
         measures.append(["0000"] * snap)
 
     # Place arrows
-    for (measure, row), arrows in zip(positions, arrow_patterns):
+    for idx, ((measure, row), arrows) in enumerate(zip(positions, arrow_patterns)):
         if measure < len(measures) and row < snap:
-            arrow_str = ""
-            for a in arrows:
-                arrow_str += "1" if a > 0.5 else "0"
+            chars = ["1" if a > 0.5 else "0" for a in arrows]
+            event = hold_events[idx]
+            tail_abs_row = hold_tail_rows[idx]
+            if event is not None and tail_abs_row is not None:
+                hold_col, _ = event
+                chars[hold_col] = "2"
+
+                tail_measure = tail_abs_row // snap
+                tail_row = tail_abs_row % snap
+                while tail_measure >= len(measures):
+                    measures.append(["0000"] * snap)
+                tail_chars = list(measures[tail_measure][tail_row])
+                tail_chars[hold_col] = "3"
+                measures[tail_measure][tail_row] = "".join(tail_chars)
+
+            arrow_str = "".join(chars)
             # Ensure at least one arrow
             if arrow_str == "0000":
                 arrow_str = "1000"
@@ -451,6 +550,7 @@ def generate_chart(
     audio_path: str | Path,
     onset_model_path: str | Path,
     pattern_model_path: str | Path,
+    hold_model_path: str | Path | None = None,
     output_path: str | Path | None = None,
     title: str | None = None,
     artist: str = "Unknown",
@@ -481,6 +581,9 @@ def generate_chart(
 
     pattern_model, pattern_mode = load_pattern_model(pattern_model_path, device)
     print(f"  Pattern mode: {pattern_mode}")
+    hold_model = load_hold_model(hold_model_path, device)
+    if hold_model is not None:
+        print("  Hold model: enabled")
 
     # Detect BPM
     tempo = librosa.beat.tempo(
@@ -508,6 +611,13 @@ def generate_chart(
         decode_strategy=decode_strategy,
         pattern_mode=pattern_mode,
     )
+    hold_events = predict_holds(
+        features,
+        onset_frames,
+        patterns,
+        hold_model,
+        device,
+    )
 
     # Write .sm file
     offset = onset_times[0] if len(onset_times) > 0 else 0.0
@@ -520,6 +630,7 @@ def generate_chart(
         offset=offset,
         onset_times=onset_times,
         arrow_patterns=patterns,
+        hold_events=hold_events,
         difficulty=difficulty,
         rating=rating,
     )
@@ -532,6 +643,7 @@ def main():
     parser.add_argument("audio", help="Path to audio file")
     parser.add_argument("--onset-model", default="checkpoints/onset_detector.pt")
     parser.add_argument("--pattern-model", default="checkpoints/pattern_generator.pt")
+    parser.add_argument("--hold-model", help="Optional hold predictor checkpoint")
     parser.add_argument("--output", "-o", help="Output .sm path")
     parser.add_argument("--title", help="Song title")
     parser.add_argument("--artist", default="Unknown")
@@ -551,6 +663,7 @@ def main():
         audio_path=args.audio,
         onset_model_path=args.onset_model,
         pattern_model_path=args.pattern_model,
+        hold_model_path=args.hold_model,
         output_path=args.output,
         title=args.title,
         artist=args.artist,
