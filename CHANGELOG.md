@@ -58,6 +58,8 @@ We introduced the first ergonomics-aware decoding layer in inference:
 - exposed decoder choice as an ablation:
   - `--decode-strategy ergonomic`
   - `--decode-strategy raw`
+- added a paper-oriented evaluation path that compares decoder strategies on fixed clips
+- added machine-readable evaluation outputs so future ablations can become tables and figures instead of one-off terminal logs
 
 This does not solve the whole problem, but it is the first real step away from unconstrained 4-bit sampling.
 
@@ -66,7 +68,7 @@ This does not solve the whole problem, but it is the first real step away from u
 Short term:
 
 - expand evaluation beyond loss/accuracy into pattern statistics and clip-based qualitative review
-- compare `raw` vs `ergonomic` decoding on fixed clips
+- compare `raw` vs `ergonomic` decoding on fixed clips and save the comparison as structured artifacts
 - tune the constrained decoder using known StepMania / ITG pattern categories
 
 Medium term:
@@ -85,3 +87,4 @@ Paper direction:
   - pattern statistics
   - ablations
   - human playability review
+  - reproducible clip-level decoder comparison reports
