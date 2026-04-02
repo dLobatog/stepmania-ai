@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from stepmania_ai.data.audio_features import AudioFeatures
@@ -47,10 +48,13 @@ def train_onset_detector(
     lr: float = 1e-3,
     device: torch.device | None = None,
     save_path: str = "onset_detector.pt",
+    log_dir: str = "runs",
 ) -> OnsetDetector:
     """Train the onset detection model."""
     device = device or get_device()
     print(f"Training onset detector on {device}")
+
+    writer = SummaryWriter(log_dir=f"{log_dir}/onset_detector")
 
     balanced = BalancedStepChartDataset(dataset, oversample_ratio=0.5)
     loader = DataLoader(balanced, batch_size=batch_size, shuffle=True, num_workers=0)
@@ -64,7 +68,13 @@ def train_onset_detector(
     pos_weight = torch.clamp(pos_weight, max=20.0)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
+    # Log hyperparameters
+    writer.add_text("hparams", f"lr={lr}, batch_size={batch_size}, epochs={epochs}, "
+                     f"pos_weight={pos_weight.item():.2f}, onset_ratio={dataset.onset_ratio:.4f}, "
+                     f"songs={len(dataset.songs)}")
+
     best_f1 = 0.0
+    global_step = 0
 
     for epoch in range(epochs):
         model.train()
@@ -87,12 +97,17 @@ def train_onset_detector(
 
             total_loss += loss.item()
             n_batches += 1
+            global_step += 1
 
             # Track metrics
             preds = (torch.sigmoid(logits) > 0.5).float()
             tp += ((preds == 1) & (labels == 1)).sum().item()
             fp += ((preds == 1) & (labels == 0)).sum().item()
             fn += ((preds == 0) & (labels == 1)).sum().item()
+
+            # Log batch loss every 50 steps
+            if global_step % 50 == 0:
+                writer.add_scalar("onset/batch_loss", loss.item(), global_step)
 
         scheduler.step()
 
@@ -101,12 +116,25 @@ def train_onset_detector(
         f1 = 2 * precision * recall / (precision + recall + 1e-8)
         avg_loss = total_loss / n_batches
 
+        # Log epoch metrics
+        writer.add_scalar("onset/epoch_loss", avg_loss, epoch)
+        writer.add_scalar("onset/precision", precision, epoch)
+        writer.add_scalar("onset/recall", recall, epoch)
+        writer.add_scalar("onset/f1", f1, epoch)
+        writer.add_scalar("onset/learning_rate", scheduler.get_last_lr()[0], epoch)
+
         print(f"  Loss: {avg_loss:.4f} | P: {precision:.3f} R: {recall:.3f} F1: {f1:.3f}")
 
         if f1 > best_f1:
             best_f1 = f1
             torch.save(model.state_dict(), save_path)
             print(f"  Saved best model (F1={f1:.3f})")
+
+    writer.add_hparams(
+        {"lr": lr, "batch_size": batch_size, "epochs": epochs},
+        {"hparam/best_f1": best_f1},
+    )
+    writer.close()
 
     print(f"Best F1: {best_f1:.3f}")
     model.load_state_dict(torch.load(save_path, weights_only=True))
@@ -188,10 +216,13 @@ def train_pattern_generator(
     seq_len: int = 64,
     device: torch.device | None = None,
     save_path: str = "pattern_generator.pt",
+    log_dir: str = "runs",
 ) -> PatternGenerator:
     """Train the pattern generation model."""
     device = device or get_device()
     print(f"\nTraining pattern generator on {device}")
+
+    writer = SummaryWriter(log_dir=f"{log_dir}/pattern_generator")
 
     pattern_ds = PatternDataset(dataset, seq_len=seq_len)
     loader = DataLoader(pattern_ds, batch_size=batch_size, shuffle=True, num_workers=0)
@@ -201,7 +232,11 @@ def train_pattern_generator(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.BCEWithLogitsLoss()
 
+    writer.add_text("hparams", f"lr={lr}, batch_size={batch_size}, epochs={epochs}, "
+                     f"seq_len={seq_len}, sequences={len(pattern_ds)}")
+
     best_loss = float("inf")
+    global_step = 0
 
     for epoch in range(epochs):
         model.train()
@@ -209,6 +244,8 @@ def train_pattern_generator(
         n_batches = 0
         correct = 0
         total = 0
+        per_arrow_correct = [0, 0, 0, 0]
+        per_arrow_total = [0, 0, 0, 0]
 
         for batch in tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs}", leave=False):
             audio = batch["audio_windows"].to(device)
@@ -226,15 +263,34 @@ def train_pattern_generator(
 
             total_loss += loss.item()
             n_batches += 1
+            global_step += 1
 
             preds = (torch.sigmoid(logits) > 0.5).float()
             correct += (preds == target).sum().item()
             total += target.numel()
 
+            # Per-arrow accuracy
+            for a in range(4):
+                per_arrow_correct[a] += (preds[:, :, a] == target[:, :, a]).sum().item()
+                per_arrow_total[a] += target[:, :, a].numel()
+
+            if global_step % 50 == 0:
+                writer.add_scalar("pattern/batch_loss", loss.item(), global_step)
+
         scheduler.step()
 
         avg_loss = total_loss / n_batches
         accuracy = correct / total if total > 0 else 0
+
+        # Log epoch metrics
+        writer.add_scalar("pattern/epoch_loss", avg_loss, epoch)
+        writer.add_scalar("pattern/accuracy", accuracy, epoch)
+        writer.add_scalar("pattern/learning_rate", scheduler.get_last_lr()[0], epoch)
+
+        arrow_names = ["left", "down", "up", "right"]
+        for a in range(4):
+            acc = per_arrow_correct[a] / (per_arrow_total[a] + 1e-8)
+            writer.add_scalar(f"pattern/accuracy_{arrow_names[a]}", acc, epoch)
 
         print(f"  Loss: {avg_loss:.4f} | Arrow accuracy: {accuracy:.3f}")
 
@@ -242,6 +298,12 @@ def train_pattern_generator(
             best_loss = avg_loss
             torch.save(model.state_dict(), save_path)
             print(f"  Saved best model (loss={avg_loss:.4f})")
+
+    writer.add_hparams(
+        {"lr": lr, "batch_size": batch_size, "epochs": epochs, "seq_len": seq_len},
+        {"hparam/best_loss": best_loss, "hparam/final_accuracy": accuracy},
+    )
+    writer.close()
 
     model.load_state_dict(torch.load(save_path, weights_only=True))
     return model

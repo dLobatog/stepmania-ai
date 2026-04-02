@@ -12,6 +12,7 @@ dependencies = [
     "soundfile>=0.12",
     "tqdm>=4.66",
     "matplotlib>=3.8",
+    "tensorboard>=2.16",
 ]
 
 [project.optional-dependencies]
