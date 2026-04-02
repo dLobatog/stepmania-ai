@@ -17,6 +17,7 @@ from pathlib import Path
 import librosa
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from stepmania_ai.data.audio_features import (
@@ -31,6 +32,111 @@ from stepmania_ai.models.pattern_generator import PatternGenerator
 
 
 ARROW_CHARS = "0123"  # left, down, up, right
+
+# Small, explicitly playable vocabulary used by the ergonomics-aware decoder.
+SINGLE_PATTERNS = (
+    (1, 0, 0, 0),
+    (0, 1, 0, 0),
+    (0, 0, 1, 0),
+    (0, 0, 0, 1),
+)
+JUMP_PATTERNS = (
+    (1, 1, 0, 0),
+    (1, 0, 1, 0),
+    (1, 0, 0, 1),
+    (0, 1, 1, 0),
+    (0, 1, 0, 1),
+    (0, 0, 1, 1),
+)
+ERGONOMIC_PATTERN_VOCAB = SINGLE_PATTERNS + JUMP_PATTERNS
+
+
+def _pattern_is_jump(pattern: np.ndarray) -> bool:
+    return int(pattern.sum()) >= 2
+
+
+def _pattern_single_column(pattern: np.ndarray) -> int | None:
+    active = np.flatnonzero(pattern)
+    if len(active) == 1:
+        return int(active[0])
+    return None
+
+
+def _stairs_like(last_four_columns: list[int]) -> bool:
+    if len(last_four_columns) != 4:
+        return False
+    return last_four_columns in ([0, 1, 2, 3], [3, 2, 1, 0])
+
+
+def _transition_penalty(
+    candidate: np.ndarray,
+    history: list[np.ndarray],
+    delta_t: float,
+) -> float:
+    """Rule-based penalty that discourages awkward local transitions.
+
+    This is intentionally simple and explicit so we can ablate it later.
+    """
+    penalty = 0.0
+    candidate_is_jump = _pattern_is_jump(candidate)
+    candidate_col = _pattern_single_column(candidate)
+
+    if candidate_is_jump:
+        penalty -= 0.15
+        if delta_t < 0.25:
+            penalty -= 0.75
+        if delta_t < 0.18:
+            penalty -= 0.75
+
+    if history:
+        prev = history[-1]
+        prev_is_jump = _pattern_is_jump(prev)
+        prev_col = _pattern_single_column(prev)
+
+        if candidate_is_jump and prev_is_jump:
+            penalty -= 0.65
+            if np.array_equal(candidate, prev):
+                penalty -= 0.5
+
+        if (
+            candidate_col is not None
+            and prev_col is not None
+            and candidate_col == prev_col
+        ):
+            if delta_t < 0.20:
+                penalty -= 1.75
+            elif delta_t < 0.35:
+                penalty -= 0.85
+            else:
+                penalty -= 0.25
+
+        if candidate_is_jump and not prev_is_jump and delta_t < 0.20:
+            penalty -= 0.4
+
+    if len(history) >= 3 and candidate_col is not None:
+        last_three_cols = [_pattern_single_column(p) for p in history[-3:]]
+        if all(col is not None for col in last_three_cols):
+            four_cols = [int(col) for col in last_three_cols] + [candidate_col]
+            if _stairs_like(four_cols):
+                penalty -= 1.0
+
+    recent_jumps = sum(1 for pattern in history[-4:] if _pattern_is_jump(pattern))
+    if candidate_is_jump and recent_jumps >= 2:
+        penalty -= 0.65
+
+    return penalty
+
+
+def _candidate_scores(
+    step_logits: torch.Tensor,
+    candidate_patterns: torch.Tensor,
+) -> torch.Tensor:
+    """Score constrained pattern candidates under the factorized arrow model."""
+    logits = step_logits.unsqueeze(0).expand(candidate_patterns.shape[0], -1)
+    return (
+        F.logsigmoid(logits) * candidate_patterns
+        + F.logsigmoid(-logits) * (1.0 - candidate_patterns)
+    ).sum(dim=1)
 
 
 def detect_onsets(
@@ -81,6 +187,7 @@ def generate_patterns(
     model: PatternGenerator,
     device: torch.device,
     temperature: float = 0.8,
+    decode_strategy: str = "ergonomic",
     context_window: int = 7,
 ) -> np.ndarray:
     """Generate arrow patterns for detected onsets."""
@@ -101,14 +208,48 @@ def generate_patterns(
     deltas = np.diff(times, prepend=times[0])
     time_deltas = torch.tensor(deltas, dtype=torch.float32).unsqueeze(0).to(device)
 
-    # Generate autoregressively
-    patterns = model.generate(
-        audio_windows,
-        time_deltas,
-        temperature=temperature,
-        show_progress=True,
-    )
-    return patterns.cpu().numpy()
+    if decode_strategy == "raw":
+        patterns = model.generate(
+            audio_windows,
+            time_deltas,
+            temperature=temperature,
+            show_progress=True,
+        )
+        return patterns.cpu().numpy()
+
+    candidate_patterns_np = np.asarray(ERGONOMIC_PATTERN_VOCAB, dtype=np.float32)
+    candidate_patterns = torch.tensor(candidate_patterns_np, dtype=torch.float32, device=device)
+
+    generated = torch.zeros(n_onsets, 4, device=device)
+    prev_arrows = torch.zeros(1, n_onsets, 4, device=device)
+    history: list[np.ndarray] = []
+
+    steps = tqdm(range(n_onsets), total=n_onsets, desc="Generating patterns", leave=False)
+    for t in steps:
+        logits = model(
+            audio_windows[:, :t + 1],
+            prev_arrows[:, :t + 1],
+            time_deltas[:, :t + 1],
+        )
+        step_logits = logits[0, t] / temperature
+        raw_scores = _candidate_scores(step_logits, candidate_patterns).cpu().numpy()
+        penalties = np.array(
+            [
+                _transition_penalty(candidate, history, float(deltas[t]))
+                for candidate in candidate_patterns_np
+            ],
+            dtype=np.float32,
+        )
+        best_idx = int(np.argmax(raw_scores + penalties))
+        best_pattern = candidate_patterns[best_idx]
+
+        generated[t] = best_pattern
+        history.append(candidate_patterns_np[best_idx])
+
+        if t + 1 < n_onsets:
+            prev_arrows[0, t + 1] = best_pattern
+
+    return generated.cpu().numpy()
 
 
 def quantize_to_beats(
@@ -234,6 +375,7 @@ def generate_chart(
     artist: str = "Unknown",
     threshold: float = 0.5,
     temperature: float = 0.8,
+    decode_strategy: str = "ergonomic",
     difficulty: str = "Challenge",
     rating: int = 10,
 ) -> Path:
@@ -277,7 +419,14 @@ def generate_chart(
 
     # Phase 2: Pattern generation
     print("Generating patterns...")
-    patterns = generate_patterns(features, onset_frames, pattern_model, device, temperature=temperature)
+    patterns = generate_patterns(
+        features,
+        onset_frames,
+        pattern_model,
+        device,
+        temperature=temperature,
+        decode_strategy=decode_strategy,
+    )
 
     # Write .sm file
     offset = onset_times[0] if len(onset_times) > 0 else 0.0
@@ -307,6 +456,12 @@ def main():
     parser.add_argument("--artist", default="Unknown")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument(
+        "--decode-strategy",
+        choices=["ergonomic", "raw"],
+        default="ergonomic",
+        help="Use the ergonomics-aware constrained decoder or the raw binary sampler.",
+    )
     parser.add_argument("--difficulty", default="Challenge")
     parser.add_argument("--rating", type=int, default=10)
     args = parser.parse_args()
@@ -320,6 +475,7 @@ def main():
         artist=args.artist,
         threshold=args.threshold,
         temperature=args.temperature,
+        decode_strategy=args.decode_strategy,
         difficulty=args.difficulty,
         rating=args.rating,
     )
