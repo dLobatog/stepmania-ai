@@ -25,6 +25,13 @@ This was done incrementally and validated with short H100 smoke runs before atte
   - copies old output head rows into the larger token heads
   - preserves the old combined feature weights while leaving the new beat branch randomly initialized
 - verified that new remote runs now register to Weights & Biases automatically under `dlobatog/stepmania-ai`
+- added richer token-pattern diagnostics to training and validation logging:
+  - repeat rate
+  - fast repeat rate
+  - fast same-single repeat rate
+  - mean step activity
+  - singles / jumps / triples / quads mix
+  - predicted-minus-target excess for repeats and dense patterns
 
 ### What We Learned
 

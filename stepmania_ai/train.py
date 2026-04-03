@@ -41,9 +41,10 @@ from stepmania_ai.models.hold_note_predictor import HoldNotePredictor
 from stepmania_ai.models.hold_utils import bucket_to_duration_beats, quantize_hold_duration
 from stepmania_ai.models.pattern_generator import PatternGenerator
 from stepmania_ai.models.pattern_token_generator import PatternTokenGenerator
-from stepmania_ai.models.pattern_vocab import START_TOKEN, VOCAB_SIZE, patterns_to_tokens
+from stepmania_ai.models.pattern_vocab import START_TOKEN, VOCAB_SIZE, get_vocab_patterns, patterns_to_tokens
 
 SEQUENCE_CACHE_VERSION = "v2-onset-window-cache-beatphase"
+FAST_REPEAT_THRESHOLD_SECONDS = 0.18
 
 
 class MetricLogger:
@@ -81,6 +82,21 @@ class MetricLogger:
             wandb.define_metric(f"{prefix}/learning_rate", step_metric=epoch_step)
             wandb.define_metric(f"{prefix}/duration_accuracy", step_metric=epoch_step)
             wandb.define_metric(f"{prefix}/exact_vocab_coverage", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/repeat_rate", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/fast_repeat_rate", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/fast_single_repeat_rate", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/repeat_excess", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/fast_single_repeat_excess", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/mean_activity", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/single_rate", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/jump_rate", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/triple_rate", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/quad_rate", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/jump_excess", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/triple_excess", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/quad_excess", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/used_token_count", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/used_token_ratio", step_metric=epoch_step)
 
         self._wandb_metric_defs_initialized = True
 
@@ -143,6 +159,95 @@ def compute_binary_metrics(tp: int, fp: int, fn: int) -> dict[str, float]:
         "recall": recall,
         "f1": f1,
     }
+
+
+def _init_token_sequence_stats(vocab_size: int) -> dict[str, object]:
+    return {
+        "position_count": 0,
+        "transition_count": 0,
+        "fast_transition_count": 0,
+        "activity_sum": 0.0,
+        "repeat_count": 0,
+        "fast_repeat_count": 0,
+        "fast_single_repeat_count": 0,
+        "single_count": 0,
+        "jump_count": 0,
+        "triple_count": 0,
+        "quad_count": 0,
+        "used_tokens": np.zeros(vocab_size, dtype=bool),
+    }
+
+
+def _update_token_sequence_stats(
+    stats: dict[str, object],
+    tokens: torch.Tensor,
+    time_deltas: torch.Tensor,
+    vocab_patterns: torch.Tensor,
+) -> None:
+    token_patterns = vocab_patterns[tokens]
+    activity = token_patterns.sum(dim=-1)
+
+    stats["position_count"] = int(stats["position_count"]) + int(tokens.numel())
+    stats["activity_sum"] = float(stats["activity_sum"]) + float(activity.sum().item())
+    stats["single_count"] = int(stats["single_count"]) + int((activity == 1).sum().item())
+    stats["jump_count"] = int(stats["jump_count"]) + int((activity == 2).sum().item())
+    stats["triple_count"] = int(stats["triple_count"]) + int((activity == 3).sum().item())
+    stats["quad_count"] = int(stats["quad_count"]) + int((activity >= 4).sum().item())
+
+    used_tokens = np.asarray(stats["used_tokens"], dtype=bool)
+    used_tokens[torch.unique(tokens).detach().cpu().numpy()] = True
+    stats["used_tokens"] = used_tokens
+
+    if tokens.shape[1] <= 1:
+        return
+
+    repeats = tokens[:, 1:] == tokens[:, :-1]
+    fast_mask = time_deltas[:, 1:] < FAST_REPEAT_THRESHOLD_SECONDS
+    single_mask = activity == 1
+    fast_single_repeats = repeats & fast_mask & single_mask[:, 1:] & single_mask[:, :-1]
+
+    stats["transition_count"] = int(stats["transition_count"]) + int(repeats.numel())
+    stats["fast_transition_count"] = int(stats["fast_transition_count"]) + int(fast_mask.sum().item())
+    stats["repeat_count"] = int(stats["repeat_count"]) + int(repeats.sum().item())
+    stats["fast_repeat_count"] = int(stats["fast_repeat_count"]) + int((repeats & fast_mask).sum().item())
+    stats["fast_single_repeat_count"] = int(stats["fast_single_repeat_count"]) + int(
+        fast_single_repeats.sum().item()
+    )
+
+
+def _finalize_token_sequence_stats(
+    pred_stats: dict[str, object],
+    target_stats: dict[str, object],
+) -> dict[str, float]:
+    def _rates(stats: dict[str, object], prefix: str = "") -> dict[str, float]:
+        positions = max(int(stats["position_count"]), 1)
+        transitions = max(int(stats["transition_count"]), 1)
+        fast_transitions = max(int(stats["fast_transition_count"]), 1)
+        used_tokens = np.asarray(stats["used_tokens"], dtype=bool)
+        return {
+            f"{prefix}mean_activity": float(stats["activity_sum"]) / positions,
+            f"{prefix}repeat_rate": int(stats["repeat_count"]) / transitions,
+            f"{prefix}fast_repeat_rate": int(stats["fast_repeat_count"]) / fast_transitions,
+            f"{prefix}fast_single_repeat_rate": int(stats["fast_single_repeat_count"]) / fast_transitions,
+            f"{prefix}single_rate": int(stats["single_count"]) / positions,
+            f"{prefix}jump_rate": int(stats["jump_count"]) / positions,
+            f"{prefix}triple_rate": int(stats["triple_count"]) / positions,
+            f"{prefix}quad_rate": int(stats["quad_count"]) / positions,
+            f"{prefix}used_token_count": float(int(used_tokens.sum())),
+            f"{prefix}used_token_ratio": float(used_tokens.mean()),
+        }
+
+    pred_metrics = _rates(pred_stats)
+    target_metrics = _rates(target_stats, prefix="target_")
+    combined = {**pred_metrics, **target_metrics}
+    combined["repeat_excess"] = pred_metrics["repeat_rate"] - target_metrics["target_repeat_rate"]
+    combined["fast_single_repeat_excess"] = (
+        pred_metrics["fast_single_repeat_rate"] - target_metrics["target_fast_single_repeat_rate"]
+    )
+    combined["jump_excess"] = pred_metrics["jump_rate"] - target_metrics["target_jump_rate"]
+    combined["triple_excess"] = pred_metrics["triple_rate"] - target_metrics["target_triple_rate"]
+    combined["quad_excess"] = pred_metrics["quad_rate"] - target_metrics["target_quad_rate"]
+    return combined
 
 
 def evaluate_onset_detector(
@@ -817,6 +922,9 @@ def evaluate_pattern_token_generator(
     n_batches = 0
     correct = 0
     total = 0
+    vocab_patterns = torch.tensor(get_vocab_patterns(model.vocab_size), dtype=torch.float32, device=device)
+    pred_stats = _init_token_sequence_stats(model.vocab_size)
+    target_stats = _init_token_sequence_stats(model.vocab_size)
 
     with torch.no_grad():
         for batch in loader:
@@ -843,16 +951,20 @@ def evaluate_pattern_token_generator(
             n_batches += 1
             correct += (preds == target).sum().item()
             total += target.numel()
+            _update_token_sequence_stats(pred_stats, preds, td, vocab_patterns)
+            _update_token_sequence_stats(target_stats, target, td, vocab_patterns)
 
     if n_batches == 0:
         return None
 
-    return {
+    metrics = {
         "loss": total_loss / n_batches,
         "token_loss": total_token_loss / n_batches,
         "transition_loss": total_transition_loss / n_batches,
         "accuracy": correct / max(total, 1),
     }
+    metrics.update(_finalize_token_sequence_stats(pred_stats, target_stats))
+    return metrics
 
 
 def evaluate_hold_note_predictor(
@@ -1090,6 +1202,7 @@ def train_pattern_token_generator(
     best_epoch = 0
     epochs_without_improvement = 0
     global_step = 0
+    vocab_patterns = torch.tensor(get_vocab_patterns(model.vocab_size), dtype=torch.float32, device=device)
 
     for epoch in range(epochs):
         model.train()
@@ -1099,6 +1212,8 @@ def train_pattern_token_generator(
         n_batches = 0
         correct = 0
         total = 0
+        pred_stats = _init_token_sequence_stats(model.vocab_size)
+        target_stats = _init_token_sequence_stats(model.vocab_size)
 
         for batch in tqdm(train_loader, desc=f"Token pattern epoch {epoch + 1}/{epochs}", leave=False):
             audio = batch["audio_windows"].to(device)
@@ -1130,6 +1245,8 @@ def train_pattern_token_generator(
             global_step += 1
             correct += (preds == target).sum().item()
             total += target.numel()
+            _update_token_sequence_stats(pred_stats, preds, td, vocab_patterns)
+            _update_token_sequence_stats(target_stats, target, td, vocab_patterns)
 
             if global_step % 50 == 0:
                 writer.add_scalar("train_pattern/batch_loss", loss.item(), global_step)
@@ -1141,6 +1258,7 @@ def train_pattern_token_generator(
             "transition_loss": total_transition_loss / max(n_batches, 1),
             "accuracy": correct / max(total, 1),
         }
+        train_metrics.update(_finalize_token_sequence_stats(pred_stats, target_stats))
         val_metrics = evaluate_pattern_token_generator(
             model,
             val_pattern_ds,
@@ -1156,24 +1274,62 @@ def train_pattern_token_generator(
         writer.add_scalar("train_pattern/accuracy", train_metrics["accuracy"], epoch)
         writer.add_scalar("train_pattern/learning_rate", scheduler.get_last_lr()[0], epoch)
         writer.add_scalar("train_pattern/exact_vocab_coverage", train_pattern_ds.exact_coverage, epoch)
+        for metric_name in [
+            "repeat_rate",
+            "fast_repeat_rate",
+            "fast_single_repeat_rate",
+            "repeat_excess",
+            "fast_single_repeat_excess",
+            "mean_activity",
+            "single_rate",
+            "jump_rate",
+            "triple_rate",
+            "quad_rate",
+            "jump_excess",
+            "triple_excess",
+            "quad_excess",
+            "used_token_count",
+            "used_token_ratio",
+        ]:
+            writer.add_scalar(f"train_pattern/{metric_name}", train_metrics[metric_name], epoch)
 
         if val_metrics is not None:
             writer.add_scalar("val_pattern/epoch_loss", val_metrics["loss"], epoch)
             writer.add_scalar("val_pattern/token_loss", val_metrics["token_loss"], epoch)
             writer.add_scalar("val_pattern/transition_loss", val_metrics["transition_loss"], epoch)
             writer.add_scalar("val_pattern/accuracy", val_metrics["accuracy"], epoch)
+            for metric_name in [
+                "repeat_rate",
+                "fast_repeat_rate",
+                "fast_single_repeat_rate",
+                "repeat_excess",
+                "fast_single_repeat_excess",
+                "mean_activity",
+                "single_rate",
+                "jump_rate",
+                "triple_rate",
+                "quad_rate",
+                "jump_excess",
+                "triple_excess",
+                "quad_excess",
+                "used_token_count",
+                "used_token_ratio",
+            ]:
+                writer.add_scalar(f"val_pattern/{metric_name}", val_metrics[metric_name], epoch)
 
         monitored_loss = val_metrics["loss"] if val_metrics is not None else train_metrics["loss"]
         status = (
             f"  Train loss: {train_metrics['loss']:.4f} | "
             f"Train acc: {train_metrics['accuracy']:.3f} | "
-            f"Train next: {train_metrics['transition_loss']:.4f}"
+            f"Train next: {train_metrics['transition_loss']:.4f} | "
+            f"Train fast-repeat: {train_metrics['fast_single_repeat_rate']:.3f}"
         )
         if val_metrics is not None:
             status += (
                 f" | Val loss: {val_metrics['loss']:.4f} | "
                 f"Val acc: {val_metrics['accuracy']:.3f} | "
-                f"Val next: {val_metrics['transition_loss']:.4f}"
+                f"Val next: {val_metrics['transition_loss']:.4f} | "
+                f"Val fast-repeat: {val_metrics['fast_single_repeat_rate']:.3f}"
             )
         print(status)
 
