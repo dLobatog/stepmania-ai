@@ -964,6 +964,64 @@ def _load_matching_state_dict(
     return sorted(missing), sorted(unexpected), sorted(shape_mismatches)
 
 
+def _adapt_pattern_token_state_dict(
+    model: PatternTokenGenerator,
+    state_dict: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], list[str]]:
+    """Project older token checkpoints into the current token model when possible."""
+    adapted: dict[str, torch.Tensor] = {}
+    notes: list[str] = []
+    current_state = model.state_dict()
+
+    for key, value in state_dict.items():
+        if key not in current_state:
+            continue
+
+        target = current_state[key]
+        if target.shape == value.shape:
+            adapted[key] = value
+            continue
+
+        if key == "token_embed.weight" and target.ndim == 2 and value.ndim == 2:
+            rows = min(target.shape[0] - 1, value.shape[0] - 1)
+            merged = target.clone()
+            merged[:rows] = value[:rows]
+            if value.shape[0] > 0 and rows < merged.shape[0]:
+                merged[rows] = value[min(rows, value.shape[0] - 1)]
+            adapted[key] = merged
+            notes.append(f"adapted {key} by copying {rows} token rows from checkpoint")
+            continue
+
+        if key in {"output.3.weight", "next_token_output.3.weight"} and target.ndim == 2 and value.ndim == 2:
+            rows = min(target.shape[0], value.shape[0])
+            cols = min(target.shape[1], value.shape[1])
+            merged = target.clone()
+            merged[:rows, :cols] = value[:rows, :cols]
+            adapted[key] = merged
+            notes.append(f"adapted {key} by copying {rows} output rows from checkpoint")
+            continue
+
+        if key in {"output.3.bias", "next_token_output.3.bias"} and target.ndim == 1 and value.ndim == 1:
+            rows = min(target.shape[0], value.shape[0])
+            merged = target.clone()
+            merged[:rows] = value[:rows]
+            adapted[key] = merged
+            notes.append(f"adapted {key} by copying {rows} bias entries from checkpoint")
+            continue
+
+        if key == "combine.weight" and target.ndim == 2 and value.ndim == 2:
+            old_cols = value.shape[1]
+            new_cols = target.shape[1]
+            if old_cols < new_cols:
+                merged = target.clone()
+                merged[:, :old_cols] = value
+                adapted[key] = merged
+                notes.append(f"adapted {key} by preserving {old_cols} old input columns and leaving beat branch initialized")
+                continue
+
+    return adapted, notes
+
+
 def train_pattern_token_generator(
     dataset: StepChartDataset,
     val_dataset: StepChartDataset | None = None,
@@ -996,8 +1054,13 @@ def train_pattern_token_generator(
     if checkpoint_path:
         payload = torch.load(checkpoint_path, map_location=device)
         state_dict = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
-        missing, unexpected, shape_mismatches = _load_matching_state_dict(model, state_dict)
+        adapted_state, adaptation_notes = _adapt_pattern_token_state_dict(model, state_dict)
+        merged_state = dict(state_dict)
+        merged_state.update(adapted_state)
+        missing, unexpected, shape_mismatches = _load_matching_state_dict(model, merged_state)
         print(f"Warm-started token pattern model from {checkpoint_path}")
+        for note in adaptation_notes:
+            print(f"  {note}")
         if missing:
             print(f"  Missing keys: {sorted(missing)}")
         if unexpected:
