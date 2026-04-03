@@ -43,7 +43,7 @@ from stepmania_ai.models.pattern_generator import PatternGenerator
 from stepmania_ai.models.pattern_token_generator import PatternTokenGenerator
 from stepmania_ai.models.pattern_vocab import START_TOKEN, VOCAB_SIZE, patterns_to_tokens
 
-SEQUENCE_CACHE_VERSION = "v1-onset-window-cache"
+SEQUENCE_CACHE_VERSION = "v2-onset-window-cache-beatphase"
 
 
 class MetricLogger:
@@ -355,6 +355,10 @@ def _build_onset_sequence_cache(base_dataset: StepChartDataset, song_idx: int) -
             window_size=base_dataset.context_frames,
         ).astype(np.float16, copy=False)
         arrows = song["arrow_labels"][onset_frames].astype(np.uint8, copy=False)
+        beat_features = song.get("beat_phase_features")
+        if beat_features is None:
+            beat_features = np.zeros((features.n_frames, 4), dtype=np.float32)
+        beat_features = beat_features[onset_frames].astype(np.float16, copy=False)
         times = onset_frames.astype(np.float32) * (features.hop_length / features.sr)
         deltas = np.diff(times, prepend=times[0]).astype(np.float32, copy=False)
     else:
@@ -363,6 +367,7 @@ def _build_onset_sequence_cache(base_dataset: StepChartDataset, song_idx: int) -
             dtype=np.float16,
         )
         arrows = np.zeros((0, 4), dtype=np.uint8)
+        beat_features = np.zeros((0, 4), dtype=np.float16)
         deltas = np.zeros((0,), dtype=np.float32)
 
     tokens, exact = patterns_to_tokens(arrows.astype(np.float32, copy=False))
@@ -388,6 +393,7 @@ def _build_onset_sequence_cache(base_dataset: StepChartDataset, song_idx: int) -
         data_path,
         audio_windows=windows,
         arrows=arrows,
+        beat_features=beat_features,
         time_deltas=deltas,
         tokens=tokens.astype(np.int16, copy=False),
         hold_targets=hold_targets,
@@ -548,6 +554,7 @@ class TokenPatternDataset(_CachedOnsetSequenceDataset):
             "audio_windows": torch.tensor(song_cache["audio_windows"][start:end], dtype=torch.float32),
             "target_tokens": tokens,
             "prev_tokens": prev_tokens,
+            "beat_features": torch.tensor(song_cache["beat_features"][start:end], dtype=torch.float32),
             "time_deltas": torch.tensor(song_cache["time_deltas"][start:end], dtype=torch.float32),
         }
 
@@ -816,9 +823,10 @@ def evaluate_pattern_token_generator(
             audio = batch["audio_windows"].to(device)
             target = batch["target_tokens"].to(device)
             prev = batch["prev_tokens"].to(device)
+            beat = batch["beat_features"].to(device)
             td = batch["time_deltas"].to(device)
 
-            logits, next_logits = model.forward_with_aux(audio, prev, td)
+            logits, next_logits = model.forward_with_aux(audio, prev, beat, td)
             token_loss = criterion(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
             transition_loss = torch.zeros((), device=device)
             if transition_loss_weight > 0 and target.shape[1] > 1:
@@ -1033,9 +1041,10 @@ def train_pattern_token_generator(
             audio = batch["audio_windows"].to(device)
             target = batch["target_tokens"].to(device)
             prev = batch["prev_tokens"].to(device)
+            beat = batch["beat_features"].to(device)
             td = batch["time_deltas"].to(device)
 
-            logits, next_logits = model.forward_with_aux(audio, prev, td)
+            logits, next_logits = model.forward_with_aux(audio, prev, beat, td)
             token_loss = criterion(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
             transition_loss = torch.zeros((), device=device)
             if transition_loss_weight > 0 and target.shape[1] > 1:

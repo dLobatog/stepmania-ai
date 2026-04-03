@@ -177,6 +177,23 @@ def _candidate_scores(
     ).sum(dim=1)
 
 
+def _compatible_state_dict(
+    model: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], list[str]]:
+    filtered: dict[str, torch.Tensor] = {}
+    mismatched: list[str] = []
+    current = model.state_dict()
+    for key, value in state_dict.items():
+        if key not in current:
+            continue
+        if current[key].shape != value.shape:
+            mismatched.append(f"{key}: checkpoint {tuple(value.shape)} != model {tuple(current[key].shape)}")
+            continue
+        filtered[key] = value
+    return filtered, mismatched
+
+
 def load_pattern_model(
     pattern_model_path: str | Path,
     device: torch.device,
@@ -187,11 +204,14 @@ def load_pattern_model(
         model_type = payload["model_type"]
         if model_type == "pattern_token_generator":
             model = PatternTokenGenerator(vocab_size=int(payload.get("vocab_size", VOCAB_SIZE)))
-            missing, unexpected = model.load_state_dict(payload["state_dict"], strict=False)
+            filtered_state, mismatched = _compatible_state_dict(model, payload["state_dict"])
+            missing, unexpected = model.load_state_dict(filtered_state, strict=False)
             if unexpected:
                 raise RuntimeError(f"Unexpected keys in token pattern checkpoint: {sorted(unexpected)}")
             if missing:
                 print(f"  Pattern checkpoint missing keys (using model defaults): {sorted(missing)}")
+            if mismatched:
+                print(f"  Pattern checkpoint shape-mismatched keys: {mismatched}")
             model.to(device)
             return model, "token"
         if model_type == "pattern_generator":
@@ -271,6 +291,8 @@ def generate_patterns(
     onset_frames: np.ndarray,
     model: PatternGenerator | PatternTokenGenerator,
     device: torch.device,
+    bpm: float | None = None,
+    beat_offset: float | None = None,
     temperature: float = 0.8,
     decode_strategy: str = "ergonomic",
     pattern_mode: str = "binary",
@@ -294,6 +316,22 @@ def generate_patterns(
     times = np.array([features.frame_to_time(f) for f in onset_frames])
     deltas = np.diff(times, prepend=times[0])
     time_deltas = torch.tensor(deltas, dtype=torch.float32).unsqueeze(0).to(device)
+    beat_features_np = np.zeros((n_onsets, 4), dtype=np.float32)
+    if bpm and bpm > 0:
+        effective_offset = times[0] if beat_offset is None else float(beat_offset)
+        beat_values = np.maximum(times - effective_offset, 0.0) / (60.0 / bpm)
+        measure_phase = (beat_values % 4.0) / 4.0
+        beat_phase = beat_values % 1.0
+        beat_features_np = np.stack(
+            [
+                np.sin(2.0 * np.pi * measure_phase),
+                np.cos(2.0 * np.pi * measure_phase),
+                np.sin(2.0 * np.pi * beat_phase),
+                np.cos(2.0 * np.pi * beat_phase),
+            ],
+            axis=1,
+        ).astype(np.float32, copy=False)
+    beat_features = torch.tensor(beat_features_np, dtype=torch.float32).unsqueeze(0).to(device)
 
     if pattern_mode == "binary" and decode_strategy == "raw":
         patterns = model.generate(
@@ -337,6 +375,7 @@ def generate_patterns(
             logits = model(
                 audio_windows[:, start:t + 1],
                 prev_tokens[:, start:t + 1],
+                beat_features[:, start:t + 1],
                 time_deltas[:, start:t + 1],
             )
             step_logits = logits[0, -1] / temperature
@@ -620,6 +659,8 @@ def generate_chart(
         onset_frames,
         pattern_model,
         device,
+        bpm=bpm,
+        beat_offset=onset_times[0] if len(onset_times) > 0 else 0.0,
         temperature=temperature,
         decode_strategy=decode_strategy,
         pattern_mode=pattern_mode,

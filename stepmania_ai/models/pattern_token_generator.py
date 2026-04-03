@@ -33,6 +33,7 @@ class PatternTokenGenerator(nn.Module):
     def __init__(
         self,
         n_audio_features: int = 93,
+        n_beat_features: int = 4,
         d_model: int = 128,
         n_heads: int = 4,
         n_layers: int = 4,
@@ -59,7 +60,11 @@ class PatternTokenGenerator(nn.Module):
             nn.Linear(1, d_model // 4),
             nn.ReLU(),
         )
-        self.combine = nn.Linear(d_model + d_model // 4 + d_model // 4, d_model)
+        self.beat_embed = nn.Sequential(
+            nn.Linear(n_beat_features, d_model // 4),
+            nn.ReLU(),
+        )
+        self.combine = nn.Linear(d_model + d_model // 4 + d_model // 4 + d_model // 4, d_model)
         self.pos_encoding = PositionalEncoding(d_model, dropout=dropout)
 
         decoder_layer = nn.TransformerDecoderLayer(
@@ -87,6 +92,7 @@ class PatternTokenGenerator(nn.Module):
         self,
         audio_windows: torch.Tensor,
         prev_tokens: torch.Tensor,
+        beat_features: torch.Tensor,
         time_deltas: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode local audio/token context and decode a causal hidden sequence."""
@@ -97,8 +103,9 @@ class PatternTokenGenerator(nn.Module):
 
         token_enc = self.token_embed(prev_tokens)
         time_enc = self.time_embed(torch.log1p(time_deltas).unsqueeze(-1))
+        beat_enc = self.beat_embed(beat_features)
 
-        combined = torch.cat([audio_enc, token_enc, time_enc], dim=-1)
+        combined = torch.cat([audio_enc, token_enc, time_enc, beat_enc], dim=-1)
         combined = self.combine(combined)
         combined = self.pos_encoding(combined)
 
@@ -114,25 +121,28 @@ class PatternTokenGenerator(nn.Module):
         self,
         audio_windows: torch.Tensor,
         prev_tokens: torch.Tensor,
+        beat_features: torch.Tensor,
         time_deltas: torch.Tensor,
     ) -> torch.Tensor:
-        decoded, _ = self._decode(audio_windows, prev_tokens, time_deltas)
+        decoded, _ = self._decode(audio_windows, prev_tokens, beat_features, time_deltas)
         return self.output(decoded)
 
     def forward_with_aux(
         self,
         audio_windows: torch.Tensor,
         prev_tokens: torch.Tensor,
+        beat_features: torch.Tensor,
         time_deltas: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return logits for the current token and an auxiliary next-token head."""
-        decoded, _ = self._decode(audio_windows, prev_tokens, time_deltas)
+        decoded, _ = self._decode(audio_windows, prev_tokens, beat_features, time_deltas)
         return self.output(decoded), self.next_token_output(decoded)
 
     @torch.no_grad()
     def generate(
         self,
         audio_windows: torch.Tensor,
+        beat_features: torch.Tensor,
         time_deltas: torch.Tensor,
         temperature: float = 1.0,
         show_progress: bool = False,
@@ -157,6 +167,7 @@ class PatternTokenGenerator(nn.Module):
             logits = self.forward(
                 audio_windows[:, start:t + 1],
                 prev_tokens[:, start:t + 1],
+                beat_features[:, start:t + 1],
                 time_deltas[:, start:t + 1],
             )
             step_logits = logits[0, -1] / temperature

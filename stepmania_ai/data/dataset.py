@@ -30,13 +30,13 @@ from stepmania_ai.data.audio_features import (
 from stepmania_ai.utils.sm_parser import Chart, NoteRow, Simfile, parse_sm
 
 
-CACHE_VERSION = "v3-holds"
+CACHE_VERSION = "v4-holds-beatphase"
 
 
 def _snap_notes_to_frames(
     chart: Chart,
     n_frames: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Align chart notes to audio frames.
 
     Returns:
@@ -45,12 +45,14 @@ def _snap_notes_to_frames(
         hold_start_labels: (n_frames,) binary array — 1 where a simple hold starts
         hold_duration_beats: (n_frames,) float array — duration in beats for simple hold starts
         roll_start_labels: (n_frames,) binary array — 1 where a simple roll starts
+        beat_phase_features: (n_frames, 4) cyclic beat/measure position features
     """
     onset_labels = np.zeros(n_frames, dtype=np.float32)
     arrow_labels = np.zeros((n_frames, 4), dtype=np.float32)
     hold_start_labels = np.zeros(n_frames, dtype=np.float32)
     hold_duration_beats = np.zeros(n_frames, dtype=np.float32)
     roll_start_labels = np.zeros(n_frames, dtype=np.float32)
+    beat_phase_features = np.zeros((n_frames, 4), dtype=np.float32)
     active_heads: dict[int, tuple[int, float, bool, bool]] = {}
 
     for row in chart.note_rows:
@@ -70,6 +72,17 @@ def _snap_notes_to_frames(
             onset_labels[frame] = 1.0
             for col in row.tap_columns:
                 arrow_labels[frame, col] = 1.0
+            measure_phase = (row.beat % 4.0) / 4.0
+            beat_phase = row.beat % 1.0
+            beat_phase_features[frame] = np.asarray(
+                [
+                    np.sin(2.0 * np.pi * measure_phase),
+                    np.cos(2.0 * np.pi * measure_phase),
+                    np.sin(2.0 * np.pi * beat_phase),
+                    np.cos(2.0 * np.pi * beat_phase),
+                ],
+                dtype=np.float32,
+            )
 
         is_simple_single = len(row.tap_columns) == 1
 
@@ -96,7 +109,7 @@ def _snap_notes_to_frames(
                 else:
                     hold_duration_beats[start_frame] = max(0.0, row.beat - start_beat)
 
-    return onset_labels, arrow_labels, hold_start_labels, hold_duration_beats, roll_start_labels
+    return onset_labels, arrow_labels, hold_start_labels, hold_duration_beats, roll_start_labels, beat_phase_features
 
 
 def _cache_key(sm_path: Path) -> str:
@@ -160,7 +173,7 @@ def build_song_data(
             return None
 
     features = extract_features(audio_path, skip_beats=True)
-    onset_labels, arrow_labels, hold_start_labels, hold_duration_beats, roll_start_labels = _snap_notes_to_frames(
+    onset_labels, arrow_labels, hold_start_labels, hold_duration_beats, roll_start_labels, beat_phase_features = _snap_notes_to_frames(
         chart,
         features.n_frames,
     )
@@ -172,6 +185,7 @@ def build_song_data(
         "hold_start_labels": hold_start_labels,
         "hold_duration_beats": hold_duration_beats,
         "roll_start_labels": roll_start_labels,
+        "beat_phase_features": beat_phase_features,
         "title": sm.title,
         "difficulty": chart.difficulty,
         "rating": chart.rating,
