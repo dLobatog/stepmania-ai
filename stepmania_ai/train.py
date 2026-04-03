@@ -941,6 +941,7 @@ def train_pattern_token_generator(
     log_dir: str = "runs",
     patience: int = 5,
     transition_loss_weight: float = 0.25,
+    checkpoint_path: str | None = None,
 ) -> PatternTokenGenerator:
     device = device or get_device()
     print(f"\nTraining token pattern generator on {device}")
@@ -957,6 +958,15 @@ def train_pattern_token_generator(
 
     train_loader = DataLoader(train_pattern_ds, batch_size=batch_size, shuffle=True, num_workers=0)
     model = PatternTokenGenerator().to(device)
+    if checkpoint_path:
+        payload = torch.load(checkpoint_path, map_location=device)
+        state_dict = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"Warm-started token pattern model from {checkpoint_path}")
+        if missing:
+            print(f"  Missing keys: {sorted(missing)}")
+        if unexpected:
+            print(f"  Unexpected keys: {sorted(unexpected)}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -970,7 +980,8 @@ def train_pattern_token_generator(
         f"lr={lr}, batch_size={batch_size}, epochs={epochs}, seq_len={seq_len}, "
         f"train_sequences={len(train_pattern_ds)}, val_sequences={len(val_pattern_ds) if val_pattern_ds else 0}, "
         f"train_vocab_coverage={train_pattern_ds.exact_coverage:.4f}, "
-        f"transition_loss_weight={transition_loss_weight:.3f}",
+        f"transition_loss_weight={transition_loss_weight:.3f}, "
+        f"checkpoint_path={checkpoint_path or 'none'}",
     )
 
     best_loss = float("inf")
@@ -1251,6 +1262,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="Onset detector learning rate")
     parser.add_argument("--pattern-lr", type=float, default=5e-4)
     parser.add_argument("--transition-loss-weight", type=float, default=0.25)
+    parser.add_argument("--pattern-checkpoint", type=str)
     parser.add_argument("--hold-lr", type=float, default=5e-4)
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--cache-dir", type=str, default=".cache/features")
@@ -1368,6 +1380,7 @@ def main():
                 "lr": args.lr,
                 "pattern_lr": args.pattern_lr,
                 "transition_loss_weight": args.transition_loss_weight,
+                "pattern_checkpoint": args.pattern_checkpoint,
                 "hold_lr": args.hold_lr,
                 "seq_len": args.seq_len,
                 "difficulty": args.difficulty,
@@ -1422,6 +1435,7 @@ def main():
             log_dir=str(log_dir),
             patience=args.patience,
             transition_loss_weight=args.transition_loss_weight,
+            checkpoint_path=args.pattern_checkpoint,
         )
     else:
         train_pattern_generator(
