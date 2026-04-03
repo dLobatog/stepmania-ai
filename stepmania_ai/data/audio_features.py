@@ -170,10 +170,15 @@ def extract_features(audio_path: str | Path, skip_beats: bool = False) -> AudioF
     # Normalize
     onset_env = onset_env / (onset_env.max() + 1e-8)
 
-    # Chroma — use STFT-based chroma (faster than CQT, similar quality for our purposes)
-    chroma = librosa.feature.chroma_stft(
-        y=y, sr=sr, hop_length=HOP_LENGTH, n_fft=N_FFT
-    )
+    # Chroma — compute from an explicit STFT + chroma filterbank instead of
+    # librosa.feature.chroma_stft(). On Linux we observed native segfaults for
+    # some songs inside that helper, while the lower-level steps remain stable.
+    stft_power = np.abs(
+        librosa.stft(y, n_fft=N_FFT, hop_length=HOP_LENGTH)
+    ) ** 2
+    chroma_filter = librosa.filters.chroma(sr=sr, n_fft=N_FFT)
+    chroma = chroma_filter @ stft_power
+    chroma = chroma / np.maximum(chroma.sum(axis=0, keepdims=True), 1e-8)
 
     # Beat tracking (skip during training for speed — only needed at generation time)
     if skip_beats:

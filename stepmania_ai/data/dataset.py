@@ -8,10 +8,14 @@ with an LRU cache to keep recently-used songs hot.
 from __future__ import annotations
 
 import hashlib
+import json
 import multiprocessing as mp
 import pickle
+import subprocess
+import sys
 from functools import lru_cache, partial
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import torch
@@ -198,6 +202,57 @@ def _extract_and_cache(sm_path: Path, difficulty: str, cache_dir: str) -> dict |
     }
 
 
+def _extract_and_cache_via_subprocess(
+    sm_path: Path,
+    difficulty: str,
+    cache_dir: str,
+    timeout_seconds: float,
+) -> dict | None:
+    """Run extraction in an isolated Python subprocess.
+
+    This is slower than the in-process worker path, but protects the main
+    training process from native-library hangs or segfaults in feature extraction.
+    """
+    cmd = [
+        sys.executable,
+        "-m",
+        "stepmania_ai.data.extract_song_cache",
+        "--sm-path",
+        str(sm_path),
+        "--difficulty",
+        difficulty,
+        "--cache-dir",
+        cache_dir,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"Skipping {sm_path}: extraction timed out after {timeout_seconds:.0f}s")
+        return None
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        suffix = f" ({detail[-1]})" if detail else ""
+        print(f"Skipping {sm_path}: extractor exited with code {proc.returncode}{suffix}")
+        return None
+
+    payload = proc.stdout.strip()
+    if not payload:
+        return None
+
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as exc:
+        print(f"Skipping {sm_path}: invalid extractor output ({exc})")
+        return None
+
+
 class StepChartDataset(Dataset):
     """Memory-efficient dataset for training.
 
@@ -219,6 +274,7 @@ class StepChartDataset(Dataset):
         n_workers: int | None = None,
         lru_size: int = 32,
         max_songs: int | None = None,
+        song_timeout_seconds: float | None = None,
     ):
         self.context_frames = context_frames
         self.quality_label = quality_label
@@ -239,21 +295,46 @@ class StepChartDataset(Dataset):
             n_workers = min(mp.cpu_count(), 4)
 
         # Extract features to cache and collect metadata
-        worker_fn = partial(_extract_and_cache, difficulty=difficulty, cache_dir=str(self.cache_dir))
-
-        if n_workers > 1:
-            print(f"Extracting features with {n_workers} workers...")
-            with mp.Pool(n_workers) as pool:
-                results = list(tqdm(
-                    pool.imap(worker_fn, sm_files),
-                    total=len(sm_files),
-                    desc="Loading songs",
-                ))
+        if song_timeout_seconds is not None and song_timeout_seconds > 0:
+            worker_fn = partial(
+                _extract_and_cache_via_subprocess,
+                difficulty=difficulty,
+                cache_dir=str(self.cache_dir),
+                timeout_seconds=float(song_timeout_seconds),
+            )
+            print(
+                f"Extracting features with {n_workers} isolated workers "
+                f"(timeout {song_timeout_seconds:.0f}s per song)..."
+            )
+            results: list[dict | None] = []
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = [executor.submit(worker_fn, path) for path in sm_files]
+                for future in tqdm(as_completed(futures), total=len(futures), desc="Loading songs"):
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:
+                        print(f"Skipping song after worker error: {exc}")
+                        results.append(None)
         else:
-            results = [worker_fn(p) for p in tqdm(sm_files, desc="Loading songs")]
+            worker_fn = partial(_extract_and_cache, difficulty=difficulty, cache_dir=str(self.cache_dir))
+            if n_workers > 1:
+                print(f"Extracting features with {n_workers} workers...")
+                with mp.Pool(n_workers, maxtasksperchild=1) as pool:
+                    results = list(
+                        tqdm(
+                            pool.imap_unordered(worker_fn, sm_files),
+                            total=len(sm_files),
+                            desc="Loading songs",
+                        )
+                    )
+            else:
+                results = [worker_fn(p) for p in tqdm(sm_files, desc="Loading songs")]
 
         # Store only lightweight metadata
-        self.song_meta: list[dict] = [r for r in results if r is not None]
+        self.song_meta = sorted(
+            (r for r in results if r is not None),
+            key=lambda item: item["path"],
+        )
         self._song_frame_counts = np.array([s["n_frames"] for s in self.song_meta], dtype=np.int64)
         self._song_cumframes = np.concatenate([[0], np.cumsum(self._song_frame_counts)])
         self._total_frames = int(self._song_cumframes[-1])

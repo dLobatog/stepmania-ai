@@ -24,6 +24,11 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+try:
+    import wandb
+except ImportError:  # pragma: no cover - optional monitoring dependency
+    wandb = None
+
 from stepmania_ai.data.audio_features import AudioFeatures
 from stepmania_ai.data.dataset import (
     BalancedStepChartDataset,
@@ -38,6 +43,66 @@ from stepmania_ai.models.pattern_token_generator import PatternTokenGenerator
 from stepmania_ai.models.pattern_vocab import START_TOKEN, VOCAB_SIZE, patterns_to_tokens
 
 SEQUENCE_CACHE_VERSION = "v1-onset-window-cache"
+
+
+class MetricLogger:
+    """Mirror TensorBoard scalars to W&B when an active run exists."""
+
+    def __init__(self, log_dir: str):
+        self.writer = SummaryWriter(log_dir=log_dir)
+        self._wandb_metric_defs_initialized = False
+        self._initialize_wandb_metrics()
+
+    def _initialize_wandb_metrics(self) -> None:
+        if self._wandb_metric_defs_initialized:
+            return
+        if wandb is None or wandb.run is None:
+            return
+
+        for prefix in [
+            "train_onset",
+            "val_onset",
+            "train_pattern",
+            "val_pattern",
+            "train_hold",
+            "val_hold",
+        ]:
+            batch_step = f"{prefix}/batch_step"
+            epoch_step = f"{prefix}/epoch"
+            wandb.define_metric(batch_step)
+            wandb.define_metric(epoch_step)
+            wandb.define_metric(f"{prefix}/batch_*", step_metric=batch_step)
+            wandb.define_metric(f"{prefix}/epoch_*", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/accuracy*", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/precision", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/recall", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/f1", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/learning_rate", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/duration_accuracy", step_metric=epoch_step)
+            wandb.define_metric(f"{prefix}/exact_vocab_coverage", step_metric=epoch_step)
+
+        self._wandb_metric_defs_initialized = True
+
+    def add_scalar(self, tag: str, value: float, step: int) -> None:
+        self.writer.add_scalar(tag, value, step)
+        if wandb is not None and wandb.run is not None:
+            self._initialize_wandb_metrics()
+            prefix = tag.split("/", 1)[0]
+            step_key = f"{prefix}/batch_step" if "/batch_" in tag else f"{prefix}/epoch"
+            wandb.log({step_key: step, tag: value})
+
+    def add_text(self, tag: str, text_string: str) -> None:
+        self.writer.add_text(tag, text_string)
+
+    def add_hparams(self, hparam_dict: dict[str, float | int], metric_dict: dict[str, float]) -> None:
+        self.writer.add_hparams(hparam_dict, metric_dict)
+        if wandb is not None and wandb.run is not None:
+            wandb.config.update(hparam_dict, allow_val_change=True)
+            for key, value in metric_dict.items():
+                wandb.run.summary[key] = value
+
+    def close(self) -> None:
+        self.writer.close()
 
 
 def get_device() -> torch.device:
@@ -128,7 +193,7 @@ def evaluate_onset_detector(
 
 
 def _log_onset_metrics(
-    writer: SummaryWriter,
+    writer: MetricLogger,
     prefix: str,
     metrics: dict[str, float],
     epoch: int,
@@ -159,7 +224,7 @@ def train_onset_detector(
     device = device or get_device()
     print(f"Training onset detector on {device}")
 
-    writer = SummaryWriter(log_dir=f"{log_dir}/onset_detector")
+    writer = MetricLogger(log_dir=f"{log_dir}/onset_detector")
 
     train_ds = BalancedStepChartDataset(dataset, samples_per_epoch=samples_per_epoch)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
@@ -596,7 +661,7 @@ def train_pattern_generator(
     device = device or get_device()
     print(f"\nTraining pattern generator on {device}")
 
-    writer = SummaryWriter(log_dir=f"{log_dir}/pattern_generator")
+    writer = MetricLogger(log_dir=f"{log_dir}/pattern_generator")
 
     train_pattern_ds = PatternDataset(dataset, seq_len=seq_len)
     if len(train_pattern_ds) == 0:
@@ -865,7 +930,7 @@ def train_pattern_token_generator(
     device = device or get_device()
     print(f"\nTraining token pattern generator on {device}")
 
-    writer = SummaryWriter(log_dir=f"{log_dir}/pattern_generator")
+    writer = MetricLogger(log_dir=f"{log_dir}/pattern_generator")
     train_pattern_ds = TokenPatternDataset(dataset, seq_len=seq_len)
     if len(train_pattern_ds) == 0:
         raise RuntimeError("No onset sequences found for token pattern training.")
@@ -998,7 +1063,7 @@ def train_hold_note_predictor(
     device = device or get_device()
     print(f"\nTraining hold note predictor on {device}")
 
-    writer = SummaryWriter(log_dir=f"{log_dir}/hold_note_predictor")
+    writer = MetricLogger(log_dir=f"{log_dir}/hold_note_predictor")
     train_hold_ds = HoldDataset(dataset, seq_len=seq_len)
     if len(train_hold_ds) == 0:
         raise RuntimeError("No onset sequences found for hold training.")
@@ -1153,8 +1218,23 @@ def main():
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-workers", type=int)
+    parser.add_argument(
+        "--song-timeout-seconds",
+        type=float,
+        default=0,
+        help="If > 0, isolate per-song feature extraction in subprocesses and skip songs that exceed this timeout.",
+    )
     parser.add_argument("--skip-onset-training", action="store_true")
     parser.add_argument("--onset-checkpoint", type=str)
+    parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
+    parser.add_argument("--wandb-project", type=str, help="W&B project name")
+    parser.add_argument("--wandb-entity", type=str, help="W&B entity or team name")
+    parser.add_argument(
+        "--wandb-mode",
+        choices=["online", "offline", "disabled"],
+        default="online",
+        help="W&B logging mode when --wandb is enabled",
+    )
     parser.add_argument(
         "--dev",
         action="store_true",
@@ -1204,6 +1284,7 @@ def main():
         difficulty=args.difficulty,
         cache_dir=args.cache_dir,
         n_workers=args.n_workers,
+        song_timeout_seconds=args.song_timeout_seconds,
     )
 
     val_dataset = None
@@ -1214,11 +1295,48 @@ def main():
             difficulty=args.difficulty,
             cache_dir=args.cache_dir,
             n_workers=args.n_workers,
+            song_timeout_seconds=args.song_timeout_seconds,
         )
 
     if len(dataset.song_meta) == 0:
         print("Training split produced no usable songs.")
         return
+
+    if args.wandb:
+        if wandb is None:
+            raise SystemExit("--wandb requested but wandb is not installed. Run `pip install wandb`.")
+        wandb.init(
+            project=args.wandb_project or "stepmania-ai",
+            entity=args.wandb_entity,
+            name=run_name,
+            mode=args.wandb_mode,
+            dir=str(log_dir.resolve()),
+            config={
+                "run_name": run_name,
+                "epochs_onset": args.epochs_onset,
+                "epochs_pattern": args.epochs_pattern,
+                "epochs_hold": args.epochs_hold,
+                "batch_size": args.batch_size,
+                "pattern_batch_size": args.pattern_batch_size,
+                "lr": args.lr,
+                "pattern_lr": args.pattern_lr,
+                "hold_lr": args.hold_lr,
+                "seq_len": args.seq_len,
+                "difficulty": args.difficulty,
+                "pattern_mode": args.pattern_mode,
+                "validation_split": args.validation_split,
+                "max_songs": args.max_songs,
+                "train_samples_per_epoch": args.train_samples_per_epoch,
+                "val_samples": args.val_samples,
+                "patience": args.patience,
+                "seed": args.seed,
+                "pack_dirs": [str(Path(p).expanduser()) for p in args.pack_dirs],
+                "train_song_count": len(train_files),
+                "val_song_count": len(val_files),
+                "loaded_train_songs": len(dataset.song_meta),
+                "loaded_val_songs": len(val_dataset.song_meta) if val_dataset else 0,
+            },
+        )
 
     onset_save_path = output_dir / "onset_detector.pt"
     if args.skip_onset_training:
@@ -1286,6 +1404,8 @@ def main():
     print(f"Run name: {run_name}")
     print(f"Models saved to {output_dir}/")
     print(f"Logs saved to {log_dir}/")
+    if args.wandb and wandb is not None and wandb.run is not None:
+        wandb.finish()
 
 
 if __name__ == "__main__":
