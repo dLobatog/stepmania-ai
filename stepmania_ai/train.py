@@ -796,6 +796,7 @@ def evaluate_pattern_token_generator(
     criterion: nn.Module,
     batch_size: int,
     device: torch.device,
+    transition_loss_weight: float = 0.0,
 ) -> dict[str, float] | None:
     if dataset is None or len(dataset) == 0:
         return None
@@ -803,6 +804,8 @@ def evaluate_pattern_token_generator(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     model.eval()
     total_loss = 0.0
+    total_token_loss = 0.0
+    total_transition_loss = 0.0
     n_batches = 0
     correct = 0
     total = 0
@@ -814,11 +817,20 @@ def evaluate_pattern_token_generator(
             prev = batch["prev_tokens"].to(device)
             td = batch["time_deltas"].to(device)
 
-            logits = model(audio, prev, td)
-            loss = criterion(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
+            logits, next_logits = model.forward_with_aux(audio, prev, td)
+            token_loss = criterion(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
+            transition_loss = torch.zeros((), device=device)
+            if transition_loss_weight > 0 and target.shape[1] > 1:
+                transition_loss = criterion(
+                    next_logits[:, :-1].reshape(-1, next_logits.shape[-1]),
+                    target[:, 1:].reshape(-1),
+                )
+            loss = token_loss + transition_loss_weight * transition_loss
             preds = torch.argmax(logits, dim=-1)
 
             total_loss += loss.item()
+            total_token_loss += token_loss.item()
+            total_transition_loss += transition_loss.item()
             n_batches += 1
             correct += (preds == target).sum().item()
             total += target.numel()
@@ -828,6 +840,8 @@ def evaluate_pattern_token_generator(
 
     return {
         "loss": total_loss / n_batches,
+        "token_loss": total_token_loss / n_batches,
+        "transition_loss": total_transition_loss / n_batches,
         "accuracy": correct / max(total, 1),
     }
 
@@ -926,6 +940,7 @@ def train_pattern_token_generator(
     save_path: str = "pattern_generator.pt",
     log_dir: str = "runs",
     patience: int = 5,
+    transition_loss_weight: float = 0.25,
 ) -> PatternTokenGenerator:
     device = device or get_device()
     print(f"\nTraining token pattern generator on {device}")
@@ -954,7 +969,8 @@ def train_pattern_token_generator(
         "hparams",
         f"lr={lr}, batch_size={batch_size}, epochs={epochs}, seq_len={seq_len}, "
         f"train_sequences={len(train_pattern_ds)}, val_sequences={len(val_pattern_ds) if val_pattern_ds else 0}, "
-        f"train_vocab_coverage={train_pattern_ds.exact_coverage:.4f}",
+        f"train_vocab_coverage={train_pattern_ds.exact_coverage:.4f}, "
+        f"transition_loss_weight={transition_loss_weight:.3f}",
     )
 
     best_loss = float("inf")
@@ -965,6 +981,8 @@ def train_pattern_token_generator(
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
+        total_token_loss = 0.0
+        total_transition_loss = 0.0
         n_batches = 0
         correct = 0
         total = 0
@@ -975,8 +993,15 @@ def train_pattern_token_generator(
             prev = batch["prev_tokens"].to(device)
             td = batch["time_deltas"].to(device)
 
-            logits = model(audio, prev, td)
-            loss = criterion(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
+            logits, next_logits = model.forward_with_aux(audio, prev, td)
+            token_loss = criterion(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
+            transition_loss = torch.zeros((), device=device)
+            if transition_loss_weight > 0 and target.shape[1] > 1:
+                transition_loss = criterion(
+                    next_logits[:, :-1].reshape(-1, next_logits.shape[-1]),
+                    target[:, 1:].reshape(-1),
+                )
+            loss = token_loss + transition_loss_weight * transition_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -985,6 +1010,8 @@ def train_pattern_token_generator(
 
             preds = torch.argmax(logits, dim=-1)
             total_loss += loss.item()
+            total_token_loss += token_loss.item()
+            total_transition_loss += transition_loss.item()
             n_batches += 1
             global_step += 1
             correct += (preds == target).sum().item()
@@ -996,6 +1023,8 @@ def train_pattern_token_generator(
         scheduler.step()
         train_metrics = {
             "loss": total_loss / max(n_batches, 1),
+            "token_loss": total_token_loss / max(n_batches, 1),
+            "transition_loss": total_transition_loss / max(n_batches, 1),
             "accuracy": correct / max(total, 1),
         }
         val_metrics = evaluate_pattern_token_generator(
@@ -1004,24 +1033,34 @@ def train_pattern_token_generator(
             criterion,
             batch_size=batch_size,
             device=device,
+            transition_loss_weight=transition_loss_weight,
         )
 
         writer.add_scalar("train_pattern/epoch_loss", train_metrics["loss"], epoch)
+        writer.add_scalar("train_pattern/token_loss", train_metrics["token_loss"], epoch)
+        writer.add_scalar("train_pattern/transition_loss", train_metrics["transition_loss"], epoch)
         writer.add_scalar("train_pattern/accuracy", train_metrics["accuracy"], epoch)
         writer.add_scalar("train_pattern/learning_rate", scheduler.get_last_lr()[0], epoch)
         writer.add_scalar("train_pattern/exact_vocab_coverage", train_pattern_ds.exact_coverage, epoch)
 
         if val_metrics is not None:
             writer.add_scalar("val_pattern/epoch_loss", val_metrics["loss"], epoch)
+            writer.add_scalar("val_pattern/token_loss", val_metrics["token_loss"], epoch)
+            writer.add_scalar("val_pattern/transition_loss", val_metrics["transition_loss"], epoch)
             writer.add_scalar("val_pattern/accuracy", val_metrics["accuracy"], epoch)
 
         monitored_loss = val_metrics["loss"] if val_metrics is not None else train_metrics["loss"]
         status = (
             f"  Train loss: {train_metrics['loss']:.4f} | "
-            f"Train acc: {train_metrics['accuracy']:.3f}"
+            f"Train acc: {train_metrics['accuracy']:.3f} | "
+            f"Train next: {train_metrics['transition_loss']:.4f}"
         )
         if val_metrics is not None:
-            status += f" | Val loss: {val_metrics['loss']:.4f} | Val acc: {val_metrics['accuracy']:.3f}"
+            status += (
+                f" | Val loss: {val_metrics['loss']:.4f} | "
+                f"Val acc: {val_metrics['accuracy']:.3f} | "
+                f"Val next: {val_metrics['transition_loss']:.4f}"
+            )
         print(status)
 
         if monitored_loss < best_loss - 1e-4:
@@ -1037,7 +1076,14 @@ def train_pattern_token_generator(
                 break
 
     writer.add_hparams(
-        {"lr": lr, "batch_size": batch_size, "epochs": epochs, "seq_len": seq_len, "patience": patience},
+        {
+            "lr": lr,
+            "batch_size": batch_size,
+            "epochs": epochs,
+            "seq_len": seq_len,
+            "patience": patience,
+            "transition_loss_weight": transition_loss_weight,
+        },
         {"hparam/best_loss": best_loss, "hparam/best_epoch": float(best_epoch)},
     )
     writer.close()
@@ -1204,6 +1250,7 @@ def main():
     parser.add_argument("--pattern-batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3, help="Onset detector learning rate")
     parser.add_argument("--pattern-lr", type=float, default=5e-4)
+    parser.add_argument("--transition-loss-weight", type=float, default=0.25)
     parser.add_argument("--hold-lr", type=float, default=5e-4)
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--cache-dir", type=str, default=".cache/features")
@@ -1320,6 +1367,7 @@ def main():
                 "pattern_batch_size": args.pattern_batch_size,
                 "lr": args.lr,
                 "pattern_lr": args.pattern_lr,
+                "transition_loss_weight": args.transition_loss_weight,
                 "hold_lr": args.hold_lr,
                 "seq_len": args.seq_len,
                 "difficulty": args.difficulty,
@@ -1373,6 +1421,7 @@ def main():
             save_path=str(output_dir / "pattern_generator.pt"),
             log_dir=str(log_dir),
             patience=args.patience,
+            transition_loss_weight=args.transition_loss_weight,
         )
     else:
         train_pattern_generator(
