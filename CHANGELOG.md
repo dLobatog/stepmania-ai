@@ -1,5 +1,45 @@
 # Changelog
 
+## 2026-04-03 - Beat-Aware Token Model Iteration
+
+### What We Tried
+
+We continued from the stronger H100 token-pattern checkpoint and focused on the next two model ideas:
+
+- expand the constrained token vocabulary beyond singles and simple jumps
+- give the token model explicit beat-position context during training and inference
+
+This was done incrementally and validated with short H100 smoke runs before attempting any longer continuation.
+
+### Implemented In This Change
+
+- expanded the ergonomic token vocabulary to allow rare triples and quads instead of banning them outright
+- increased decode-time penalties for dense 3-arrow and 4-arrow patterns so they stay rare unless the model strongly prefers them
+- added beat-position features to the token pattern model:
+  - measure-phase sine/cosine
+  - beat-phase sine/cosine
+- stored beat-position features in cached training sequences so the model can learn phrase placement without reintroducing unstable beat tracking in the Linux feature-extraction path
+- added backward-compatible checkpoint loading for the larger token vocabulary and beat-aware architecture
+- added a smarter warm-start adapter that:
+  - copies old token embeddings into the expanded embedding table
+  - copies old output head rows into the larger token heads
+  - preserves the old combined feature weights while leaving the new beat branch randomly initialized
+- verified that new remote runs now register to Weights & Biases automatically under `dlobatog/stepmania-ai`
+
+### What We Learned
+
+- naive warm-starting into the larger vocab/beat-aware model was too destructive because too many learned weights were dropped
+- the adapted warm-start path is much better: only the new beat branch remains randomly initialized
+- W&B monitoring is now working reliably on the H100 box for new runs
+- the next useful question is no longer "does the run start?" but "does beat-aware conditioning improve generated chart feel over the transition-loss baseline?"
+
+### What We Will Do Next
+
+- run a short multi-epoch H100 continuation from the adapted warm-start checkpoint
+- render fresh `migos` and `paseo_estopa` comparison simfiles from that run
+- if chart feel improves, continue training this beat-aware token model for a few more epochs
+- if chart feel does not improve, keep the safer vocab changes and revisit the beat-conditioning design before investing in a longer run
+
 ## 2026-04-02 - Baseline Training And Decoder Pivot
 
 ### What We Tried
