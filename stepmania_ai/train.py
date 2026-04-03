@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from functools import lru_cache
+import os
 from pathlib import Path
 import pickle
 import shutil
@@ -1286,6 +1287,7 @@ def main():
     parser.add_argument("--skip-onset-training", action="store_true")
     parser.add_argument("--onset-checkpoint", type=str)
     parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases even if configured in the environment")
     parser.add_argument("--wandb-project", type=str, help="W&B project name")
     parser.add_argument("--wandb-entity", type=str, help="W&B entity or team name")
     parser.add_argument(
@@ -1361,12 +1363,17 @@ def main():
         print("Training split produced no usable songs.")
         return
 
-    if args.wandb:
+    wandb_requested = args.wandb or (
+        not args.no_wandb
+        and bool(os.environ.get("WANDB_API_KEY"))
+    )
+
+    if wandb_requested:
         if wandb is None:
-            raise SystemExit("--wandb requested but wandb is not installed. Run `pip install wandb`.")
+            raise SystemExit("W&B requested but wandb is not installed. Run `pip install wandb`.")
         wandb.init(
-            project=args.wandb_project or "stepmania-ai",
-            entity=args.wandb_entity,
+            project=args.wandb_project or os.environ.get("WANDB_PROJECT") or "stepmania-ai",
+            entity=args.wandb_entity or os.environ.get("WANDB_ENTITY"),
             name=run_name,
             mode=args.wandb_mode,
             dir=str(log_dir.resolve()),
@@ -1467,7 +1474,7 @@ def main():
     print(f"Run name: {run_name}")
     print(f"Models saved to {output_dir}/")
     print(f"Logs saved to {log_dir}/")
-    if args.wandb and wandb is not None and wandb.run is not None:
+    if wandb_requested and wandb is not None and wandb.run is not None:
         wandb.finish()
 
 
