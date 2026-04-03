@@ -16,11 +16,31 @@ ERGONOMIC_PATTERN_VOCAB: tuple[tuple[int, int, int, int], ...] = (
     (0, 1, 1, 0),
     (0, 1, 0, 1),
     (0, 0, 1, 1),
+    (1, 1, 1, 0),
+    (1, 1, 0, 1),
+    (1, 0, 1, 1),
+    (0, 1, 1, 1),
+    (1, 1, 1, 1),
 )
 
 VOCAB_SIZE = len(ERGONOMIC_PATTERN_VOCAB)
-START_TOKEN = VOCAB_SIZE
 _PATTERN_TO_INDEX = {pattern: idx for idx, pattern in enumerate(ERGONOMIC_PATTERN_VOCAB)}
+
+
+def start_token(vocab_size: int = VOCAB_SIZE) -> int:
+    return int(vocab_size)
+
+
+START_TOKEN = start_token()
+
+
+def get_vocab_patterns(vocab_size: int = VOCAB_SIZE) -> np.ndarray:
+    vocab_size = min(int(vocab_size), VOCAB_SIZE)
+    return np.asarray(ERGONOMIC_PATTERN_VOCAB[:vocab_size], dtype=np.float32)
+
+
+def pattern_activity(pattern: np.ndarray | list[float] | tuple[int, ...]) -> int:
+    return int(sum(normalize_pattern(pattern)))
 
 
 def normalize_pattern(pattern: np.ndarray | list[float] | tuple[int, ...]) -> tuple[int, int, int, int]:

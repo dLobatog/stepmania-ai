@@ -930,6 +930,32 @@ def _save_hold_checkpoint(model: HoldNotePredictor, save_path: str):
     )
 
 
+def _load_matching_state_dict(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+) -> tuple[list[str], list[str], list[str]]:
+    """Load only checkpoint tensors whose names and shapes still match."""
+    current_state = model.state_dict()
+    filtered_state: dict[str, torch.Tensor] = {}
+    shape_mismatches: list[str] = []
+    unexpected: list[str] = []
+
+    for key, value in state_dict.items():
+        if key not in current_state:
+            unexpected.append(key)
+            continue
+        if current_state[key].shape != value.shape:
+            shape_mismatches.append(
+                f"{key}: checkpoint {tuple(value.shape)} != model {tuple(current_state[key].shape)}"
+            )
+            continue
+        filtered_state[key] = value
+
+    missing, unexpected_after = model.load_state_dict(filtered_state, strict=False)
+    unexpected.extend(unexpected_after)
+    return sorted(missing), sorted(unexpected), sorted(shape_mismatches)
+
+
 def train_pattern_token_generator(
     dataset: StepChartDataset,
     val_dataset: StepChartDataset | None = None,
@@ -962,12 +988,16 @@ def train_pattern_token_generator(
     if checkpoint_path:
         payload = torch.load(checkpoint_path, map_location=device)
         state_dict = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        missing, unexpected, shape_mismatches = _load_matching_state_dict(model, state_dict)
         print(f"Warm-started token pattern model from {checkpoint_path}")
         if missing:
             print(f"  Missing keys: {sorted(missing)}")
         if unexpected:
             print(f"  Unexpected keys: {sorted(unexpected)}")
+        if shape_mismatches:
+            print("  Shape-mismatched keys:")
+            for line in shape_mismatches:
+                print(f"    {line}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 

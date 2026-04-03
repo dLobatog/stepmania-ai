@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from stepmania_ai.models.pattern_vocab import START_TOKEN, VOCAB_SIZE
+from stepmania_ai.models.pattern_vocab import VOCAB_SIZE, start_token
 
 
 class PositionalEncoding(nn.Module):
@@ -41,6 +41,7 @@ class PatternTokenGenerator(nn.Module):
     ):
         super().__init__()
         self.vocab_size = vocab_size
+        self.start_token = start_token(vocab_size)
 
         self.audio_cnn = nn.Sequential(
             nn.Conv1d(n_audio_features, 64, kernel_size=3, padding=1),
@@ -141,7 +142,7 @@ class PatternTokenGenerator(nn.Module):
         _, seq_len, _, _ = audio_windows.shape
         prev_tokens = torch.full(
             (1, seq_len),
-            START_TOKEN,
+            self.start_token,
             dtype=torch.long,
             device=audio_windows.device,
         )

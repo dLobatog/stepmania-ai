@@ -32,7 +32,7 @@ from stepmania_ai.models.hold_utils import bucket_to_duration_beats
 from stepmania_ai.models.onset_detector import OnsetDetector
 from stepmania_ai.models.pattern_generator import PatternGenerator
 from stepmania_ai.models.pattern_token_generator import PatternTokenGenerator
-from stepmania_ai.models.pattern_vocab import ERGONOMIC_PATTERN_VOCAB, VOCAB_SIZE
+from stepmania_ai.models.pattern_vocab import VOCAB_SIZE, get_vocab_patterns, pattern_activity
 
 
 ARROW_CHARS = "0123"  # left, down, up, right
@@ -83,6 +83,14 @@ def _transition_penalty(
         if delta_t < 0.25:
             penalty -= 0.75
         if delta_t < 0.18:
+            penalty -= 0.75
+
+    activity = pattern_activity(candidate)
+    if activity >= 3:
+        penalty -= 1.5
+        if delta_t < 0.30:
+            penalty -= 1.5
+        if activity == 4:
             penalty -= 0.75
 
     if history:
@@ -179,7 +187,11 @@ def load_pattern_model(
         model_type = payload["model_type"]
         if model_type == "pattern_token_generator":
             model = PatternTokenGenerator(vocab_size=int(payload.get("vocab_size", VOCAB_SIZE)))
-            model.load_state_dict(payload["state_dict"])
+            missing, unexpected = model.load_state_dict(payload["state_dict"], strict=False)
+            if unexpected:
+                raise RuntimeError(f"Unexpected keys in token pattern checkpoint: {sorted(unexpected)}")
+            if missing:
+                print(f"  Pattern checkpoint missing keys (using model defaults): {sorted(missing)}")
             model.to(device)
             return model, "token"
         if model_type == "pattern_generator":
@@ -293,7 +305,8 @@ def generate_patterns(
         )
         return patterns.cpu().numpy()
 
-    candidate_patterns_np = np.asarray(ERGONOMIC_PATTERN_VOCAB, dtype=np.float32)
+    token_vocab_size = model.vocab_size if pattern_mode == "token" else VOCAB_SIZE
+    candidate_patterns_np = get_vocab_patterns(token_vocab_size)
     candidate_patterns = torch.tensor(candidate_patterns_np, dtype=torch.float32, device=device)
 
     generated = torch.zeros(n_onsets, 4, device=device)
@@ -304,7 +317,7 @@ def generate_patterns(
     else:
         prev_tokens = torch.full(
             (1, n_onsets),
-            VOCAB_SIZE,
+            token_vocab_size,
             dtype=torch.long,
             device=device,
         )
